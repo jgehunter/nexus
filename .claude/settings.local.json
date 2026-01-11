@@ -5,7 +5,8 @@
       "Bash(uv run python:*)",
       "Bash(uv run uvicorn:*)",
       "Bash(curl:*)",
-      "Bash(dir:*)"
+      "Bash(dir:*)",
+      "Bash(uv run pytest:*)"
     ]
   }
 }
