@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "Bash(uv run python:*)",
+      "Bash(uv run uvicorn:*)",
+      "Bash(curl:*)",
+      "Bash(dir:*)"
+    ]
+  }
+}
