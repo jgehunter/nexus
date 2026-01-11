@@ -6,7 +6,17 @@
       "Bash(uv run uvicorn:*)",
       "Bash(curl:*)",
       "Bash(dir:*)",
-      "Bash(uv run pytest:*)"
+      "Bash(uv run pytest:*)",
+      "Bash(if [ ! -d \"src/efxbt/engine/shard\" ])",
+      "Bash(then mkdir -p src/efxbt/engine/shard)",
+      "Bash(else echo \"Shard directory already exists\")",
+      "Bash(fi)",
+      "Bash(git checkout:*)",
+      "Bash(git pull:*)",
+      "Bash(uv run mypy:*)",
+      "Bash(git ls-tree:*)",
+      "Bash(git rm:*)",
+      "Bash(git add:*)"
     ]
   }
 }
