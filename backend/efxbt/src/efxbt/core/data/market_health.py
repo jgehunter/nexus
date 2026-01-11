@@ -16,13 +16,13 @@ from typing import Any
 import duckdb
 import pyarrow.parquet as pq
 
-from efxbt.core.data.registry import (
+from .registry import (
     MarketDatasetInventory,
     MarketPairDateInventory,
     TradeBookInventory,
     TradeDateInventory,
 )
-from efxbt.core.data.schemas import MARKET_ARROW_SCHEMA, TRADE_ARROW_SCHEMA
+from .schemas import MARKET_ARROW_SCHEMA, TRADE_ARROW_SCHEMA
 
 
 @dataclass

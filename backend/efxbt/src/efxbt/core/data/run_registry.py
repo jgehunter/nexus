@@ -161,13 +161,13 @@ class RunRegistry:
         run_dir.mkdir(parents=True)
 
         config_hash = compute_config_hash(config)
-        now = datetime.utcnow()
+        now_ms = int(datetime.utcnow().timestamp() * 1000)
 
         record = RunRecord(
             run_id=run_id,
             config_hash=config_hash,
             status=RunStatus.CREATED,
-            created_at=now,
+            created_at_ms=now_ms,
             config=config,
         )
 
@@ -247,17 +247,9 @@ class RunRegistry:
             run_id=run_id,
             config_hash=status_data["config_hash"],
             status=RunStatus(status_data["status"]),
-            created_at=datetime.fromisoformat(status_data["created_at"]),
-            started_at=(
-                datetime.fromisoformat(status_data["started_at"])
-                if status_data.get("started_at")
-                else None
-            ),
-            completed_at=(
-                datetime.fromisoformat(status_data["completed_at"])
-                if status_data.get("completed_at")
-                else None
-            ),
+            created_at_ms=status_data["created_at_ms"],
+            started_at_ms=status_data.get("started_at_ms"),
+            completed_at_ms=status_data.get("completed_at_ms"),
             total_shards=status_data.get("total_shards", 0),
             completed_shards=status_data.get("completed_shards", 0),
             failed_shards=status_data.get("failed_shards", 0),
@@ -384,8 +376,8 @@ class RunRegistry:
             except (RunNotFoundError, json.JSONDecodeError):
                 continue
 
-        # Sort by created_at descending (newest first)
-        runs.sort(key=lambda r: r.created_at, reverse=True)
+        # Sort by created_at_ms descending (newest first)
+        runs.sort(key=lambda r: r.created_at_ms, reverse=True)
 
         # Apply pagination
         return runs[offset : offset + limit]
@@ -455,11 +447,9 @@ class RunRegistry:
             "run_id": record.run_id,
             "config_hash": record.config_hash,
             "status": record.status.value,
-            "created_at": record.created_at.isoformat(),
-            "started_at": record.started_at.isoformat() if record.started_at else None,
-            "completed_at": (
-                record.completed_at.isoformat() if record.completed_at else None
-            ),
+            "created_at_ms": record.created_at_ms,
+            "started_at_ms": record.started_at_ms,
+            "completed_at_ms": record.completed_at_ms,
             "total_shards": record.total_shards,
             "completed_shards": record.completed_shards,
             "failed_shards": record.failed_shards,

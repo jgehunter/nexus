@@ -57,17 +57,21 @@ def cleanup_old_runs(
     stats["skipped_active"] = len(all_runs) - len(terminal_runs)
 
     # Sort by creation date (oldest first)
-    terminal_runs.sort(key=lambda r: r.created_at)
+    terminal_runs.sort(key=lambda r: r.created_at_ms)
 
-    # Calculate age cutoff
-    cutoff = datetime.utcnow() - timedelta(days=retention_days) if retention_days > 0 else None
+    # Calculate age cutoff in milliseconds
+    cutoff_ms = (
+        int((datetime.utcnow() - timedelta(days=retention_days)).timestamp() * 1000)
+        if retention_days > 0
+        else None
+    )
 
     to_delete = set()
 
     # Mark runs for deletion by age
-    if cutoff:
+    if cutoff_ms:
         for run in terminal_runs:
-            if run.created_at < cutoff:
+            if run.created_at_ms < cutoff_ms:
                 to_delete.add(run.run_id)
                 stats["deleted_by_age"] += 1
 

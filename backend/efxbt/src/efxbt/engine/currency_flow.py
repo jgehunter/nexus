@@ -278,6 +278,8 @@ class CurrencyFlowTracker:
             curr_input_qty = curr_leg["qty"]
 
             # Check if they match (within tolerance)
+            if prev_output_qty == 0:
+                return False
             if abs(prev_output_qty - curr_input_qty) / prev_output_qty > tolerance:
                 return False
 

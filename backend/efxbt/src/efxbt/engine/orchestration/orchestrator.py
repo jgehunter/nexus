@@ -204,11 +204,12 @@ class RunOrchestrator:
 
         if not shards:
             # No shards to simulate - mark as completed immediately
+            now_ms = int(datetime.utcnow().timestamp() * 1000)
             self.registry.update_status(
                 run_id,
                 RunStatus.COMPLETED,
-                started_at=datetime.utcnow(),
-                completed_at=datetime.utcnow(),
+                started_at_ms=now_ms,
+                completed_at_ms=now_ms,
             )
             self._write_empty_results(run_id)
             return
@@ -219,7 +220,7 @@ class RunOrchestrator:
         self.registry.update_status(
             run_id,
             RunStatus.RUNNING,
-            started_at=datetime.utcnow(),
+            started_at_ms=int(datetime.utcnow().timestamp() * 1000),
         )
         self.registry.update_progress(run_id, total_shards=len(shards))
 
@@ -422,14 +423,14 @@ class RunOrchestrator:
                 self.registry.update_status(
                     run_id,
                     RunStatus.FAILED,
-                    completed_at=datetime.utcnow(),
+                    completed_at_ms=int(datetime.utcnow().timestamp() * 1000),
                     error_message=f"{len(failed_pairs)} pair(s) failed",
                 )
             else:
                 self.registry.update_status(
                     run_id,
                     RunStatus.COMPLETED,
-                    completed_at=datetime.utcnow(),
+                    completed_at_ms=int(datetime.utcnow().timestamp() * 1000),
                 )
 
         except Exception as e:
@@ -438,7 +439,7 @@ class RunOrchestrator:
                 self.registry.update_status(
                     run_id,
                     RunStatus.FAILED,
-                    completed_at=datetime.utcnow(),
+                    completed_at_ms=int(datetime.utcnow().timestamp() * 1000),
                     error_message=f"Finalization error: {e}",
                 )
             except Exception:

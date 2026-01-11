@@ -186,7 +186,7 @@ class RunService:
             completed_shards=run.completed_shards,
             failed_shards=run.failed_shards,
             progress_pct=run.progress_pct,
-            started_at=run.started_at,
+            started_at_ms=run.started_at_ms,
             error_message=run.error_message,
         )
 
@@ -209,9 +209,9 @@ class RunService:
             status=run.status,
             config_hash=run.config_hash,
             config=run.config,
-            created_at=run.created_at,
-            started_at=run.started_at,
-            completed_at=run.completed_at,
+            created_at_ms=run.created_at_ms,
+            started_at_ms=run.started_at_ms,
+            completed_at_ms=run.completed_at_ms,
             total_shards=run.total_shards,
             completed_shards=run.completed_shards,
             failed_shards=run.failed_shards,
@@ -290,9 +290,9 @@ class RunService:
                 status=run.status,
                 config_hash=run.config_hash,
                 config=run.config,
-                created_at=run.created_at,
-                started_at=run.started_at,
-                completed_at=run.completed_at,
+                created_at_ms=run.created_at_ms,
+                started_at_ms=run.started_at_ms,
+                completed_at_ms=run.completed_at_ms,
                 total_shards=run.total_shards,
                 completed_shards=run.completed_shards,
                 failed_shards=run.failed_shards,
@@ -556,9 +556,10 @@ class RunService:
                     breakdown.append(entry)
 
             elif group_by == "date" and "timestamp_ms" in df.columns:
-                # Extract date from timestamp
+                # Extract date from timestamp (convert ms to YYYYMMDD)
+                from datetime import datetime, timezone
                 df["date"] = df["timestamp_ms"].apply(
-                    lambda x: str(x)[:8] if x else "unknown"
+                    lambda x: datetime.fromtimestamp(x / 1000, tz=timezone.utc).strftime("%Y%m%d") if x else "unknown"
                 )
                 grouped = df.groupby("date")[available_cols].sum().reset_index()
                 breakdown = []

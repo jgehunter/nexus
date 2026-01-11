@@ -1,6 +1,5 @@
 """Run-related data models for orchestration and persistence."""
 
-from datetime import datetime
 from typing import Annotated, Any
 
 from pydantic import BaseModel, Field
@@ -17,8 +16,8 @@ class ShardProgress(BaseModel):
         str,
         Field(description="Shard status: pending, running, completed, failed"),
     ]
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
+    started_at_ms: int | None = None
+    completed_at_ms: int | None = None
     error: str | None = None
 
 
@@ -41,10 +40,10 @@ class RunRecord(BaseModel):
     ]
     status: RunStatus = RunStatus.CREATED
 
-    # Timestamps
-    created_at: datetime
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
+    # Timestamps (int64 milliseconds since epoch)
+    created_at_ms: int
+    started_at_ms: int | None = None
+    completed_at_ms: int | None = None
 
     # Progress tracking
     total_shards: int = 0
@@ -84,7 +83,7 @@ class RunStatusResponse(BaseModel):
     completed_shards: int
     failed_shards: int
     progress_pct: float
-    started_at: datetime | None = None
+    started_at_ms: int | None = None
     error_message: str | None = None
 
 
@@ -96,10 +95,10 @@ class RunDetailResponse(BaseModel):
     config_hash: str
     config: RunConfig
 
-    # Timestamps
-    created_at: datetime
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
+    # Timestamps (int64 milliseconds since epoch)
+    created_at_ms: int
+    started_at_ms: int | None = None
+    completed_at_ms: int | None = None
 
     # Progress
     total_shards: int
