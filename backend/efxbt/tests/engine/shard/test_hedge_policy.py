@@ -214,6 +214,136 @@ class TestAggressiveHedgePolicy:
         # Position 1800 < band 2000, no hedge
         assert len(hedges) == 0
 
+    def test_per_pair_band_override(self):
+        """Test per-pair band override using pair_bands config."""
+        policy = AggressiveHedgePolicy()
+
+        state = ShardState(
+            pair="EURUSD",
+            date="20240101",
+            net_position=1500.0,  # Exceeds global band 1000, but within EURUSD band 2000
+        )
+
+        snapshot = MarketSnapshot(
+            timestamp_ms=1704110400000,
+            pair="EURUSD",
+            mid=1.1000,
+            bid=1.0998,
+            ask=1.1002,
+            spread=0.0004,
+            fx_rate=1.0,
+        )
+
+        config = {
+            "risk_band_qty": 1000.0,
+            "hedge_mode": "full",
+            "pair_bands": {"EURUSD": 2000.0},
+        }
+
+        hedges = policy.evaluate(state, snapshot, config)
+
+        # No hedge: 1500 < 2000 (EURUSD-specific band)
+        assert len(hedges) == 0
+
+    def test_per_pair_band_triggers_hedge(self):
+        """Test hedge triggered when position exceeds pair-specific band."""
+        policy = AggressiveHedgePolicy()
+
+        state = ShardState(
+            pair="GBPUSD",
+            date="20240101",
+            net_position=600.0,  # Within global band 1000, but exceeds GBPUSD band 500
+        )
+
+        snapshot = MarketSnapshot(
+            timestamp_ms=1704110400000,
+            pair="GBPUSD",
+            mid=1.2500,
+            bid=1.2498,
+            ask=1.2502,
+            spread=0.0004,
+            fx_rate=1.0,
+        )
+
+        config = {
+            "risk_band_qty": 1000.0,
+            "hedge_mode": "full",
+            "pair_bands": {"GBPUSD": 500.0, "EURUSD": 2000.0},
+        }
+
+        hedges = policy.evaluate(state, snapshot, config)
+
+        # Hedge triggered: 600 > 500 (GBPUSD-specific band)
+        assert len(hedges) == 1
+        assert hedges[0]["side"] == -1  # SELL
+        assert abs(hedges[0]["qty"] - 600.0) < 1e-8  # Full flatten
+
+    def test_per_pair_band_fallback_to_global(self):
+        """Test fallback to global band when pair not in pair_bands."""
+        policy = AggressiveHedgePolicy()
+
+        state = ShardState(
+            pair="USDJPY",  # Not in pair_bands
+            date="20240101",
+            net_position=1500.0,  # Exceeds global band 1000
+        )
+
+        snapshot = MarketSnapshot(
+            timestamp_ms=1704110400000,
+            pair="USDJPY",
+            mid=150.00,
+            bid=149.98,
+            ask=150.02,
+            spread=0.04,
+            fx_rate=1.0,
+        )
+
+        config = {
+            "risk_band_qty": 1000.0,
+            "hedge_mode": "full",
+            "pair_bands": {"EURUSD": 2000.0, "GBPUSD": 500.0},
+        }
+
+        hedges = policy.evaluate(state, snapshot, config)
+
+        # Hedge triggered: USDJPY uses global band (1000), 1500 > 1000
+        assert len(hedges) == 1
+        assert hedges[0]["side"] == -1
+        assert abs(hedges[0]["qty"] - 1500.0) < 1e-8
+
+    def test_per_pair_band_partial_mode(self):
+        """Test per-pair band with partial hedge mode."""
+        policy = AggressiveHedgePolicy()
+
+        state = ShardState(
+            pair="EURUSD",
+            date="20240101",
+            net_position=2500.0,  # Exceeds EURUSD band 2000
+        )
+
+        snapshot = MarketSnapshot(
+            timestamp_ms=1704110400000,
+            pair="EURUSD",
+            mid=1.1000,
+            bid=1.0998,
+            ask=1.1002,
+            spread=0.0004,
+            fx_rate=1.0,
+        )
+
+        config = {
+            "risk_band_qty": 1000.0,
+            "hedge_mode": "partial",
+            "pair_bands": {"EURUSD": 2000.0},
+        }
+
+        hedges = policy.evaluate(state, snapshot, config)
+
+        # Partial hedge: 2500 - 2000 = 500
+        assert len(hedges) == 1
+        assert hedges[0]["side"] == -1
+        assert abs(hedges[0]["qty"] - 500.0) < 1e-8
+
 
 class TestPassiveHedgePolicy:
     """Test passive hedge policy (not yet implemented)."""

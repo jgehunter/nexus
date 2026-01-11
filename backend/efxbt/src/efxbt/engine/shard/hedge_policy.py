@@ -60,11 +60,16 @@ class AggressiveHedgePolicy(HedgePolicy):
 
     Configuration:
         risk_band_qty: float (default: 1000.0)
-            Maximum absolute position before hedging
+            Maximum absolute position before hedging (global default)
 
         hedge_mode: str (default: "full")
             - "full": Flatten position completely (hedge entire position)
             - "partial": Hedge back to risk band edge (hedge excess only)
+
+        pair_bands: dict[str, float] (optional)
+            Per-pair band overrides in base currency units.
+            Example: {"EURUSD": 2000.0, "GBPUSD": 1500.0}
+            Pairs not in this dict use the global risk_band_qty.
 
     Behavior:
         - If |position| <= risk_band_qty: No hedge
@@ -86,6 +91,12 @@ class AggressiveHedgePolicy(HedgePolicy):
         >>> hedges = policy.evaluate(state, snapshot, config)
         >>> hedges[0]["qty"]
         500.0  # Partial (1500 - 1000)
+
+        >>> # Per-pair band override
+        >>> config = {"risk_band_qty": 1000.0, "pair_bands": {"EURUSD": 2000.0}}
+        >>> state = ShardState(pair="EURUSD", net_position=1500.0, ...)
+        >>> hedges = policy.evaluate(state, snapshot, config)
+        []  # No hedge, 1500 < 2000 (EURUSD-specific band)
     """
 
     def evaluate(
@@ -99,12 +110,15 @@ class AggressiveHedgePolicy(HedgePolicy):
         Args:
             state: Current shard state
             market_snapshot: Current market snapshot
-            config: Policy config with risk_band_qty and hedge_mode
+            config: Policy config with risk_band_qty, hedge_mode, and optional pair_bands
 
         Returns:
             List of hedge trades (empty if no hedge needed)
         """
-        risk_band_qty = config.get("risk_band_qty", 1000.0)
+        # Get pair-specific band or fall back to global default
+        pair_bands = config.get("pair_bands", {})
+        global_band = config.get("risk_band_qty", 1000.0)
+        risk_band_qty = pair_bands.get(state.pair, global_band)
         hedge_mode = config.get("hedge_mode", "full")
 
         abs_pos = abs(state.net_position)
