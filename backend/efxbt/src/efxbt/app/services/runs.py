@@ -17,6 +17,7 @@ from ...core.data.run_models import (
     RunSummary,
     TimeseriesPoint,
     TimeseriesResponse,
+    TradeRecord,
 )
 from ...core.data.run_registry import (
     DuplicateRunError,
@@ -591,6 +592,86 @@ class RunService:
                 group_by=group_by,
                 breakdown=[],
             )
+
+    def get_trades(
+        self,
+        run_id: str,
+        limit: int = 100,
+        offset: int = 0,
+        pair: str | None = None,
+    ) -> tuple[list[TradeRecord], int]:
+        """Get paginated trade-level data.
+
+        Args:
+            run_id: Run identifier
+            limit: Maximum trades to return
+            offset: Pagination offset
+            pair: Optional filter by currency pair
+
+        Returns:
+            Tuple of (trade records, total count)
+
+        Raises:
+            RunNotFoundError: If run doesn't exist
+            InvalidRunStateError: If run not completed
+        """
+        import pyarrow.parquet as pq
+
+        run = self.registry.get_run(run_id)
+
+        if run.status not in (RunStatus.COMPLETED, RunStatus.FAILED):
+            raise InvalidRunStateError(
+                run_id,
+                run.status,
+                "Trades only available for completed or failed runs",
+            )
+
+        pnl_path = self.registry.get_run_dir(run_id) / "pnl_attribution.parquet"
+
+        if not pnl_path.exists():
+            return [], 0
+
+        try:
+            table = pq.read_table(pnl_path)
+            if table.num_rows == 0:
+                return [], 0
+
+            df = table.to_pandas()
+
+            # Filter by pair if specified
+            if pair and "pair" in df.columns:
+                df = df[df["pair"] == pair]
+
+            total = len(df)
+
+            # Sort by timestamp and paginate
+            if "timestamp_ms" in df.columns:
+                df = df.sort_values("timestamp_ms")
+
+            df = df.iloc[offset : offset + limit]
+
+            # Convert to TradeRecord objects
+            trades = []
+            for _, row in df.iterrows():
+                trade = TradeRecord(
+                    timestamp_ms=int(row.get("timestamp_ms", 0)),
+                    pair=str(row.get("pair", "")),
+                    event_type=str(row.get("event_type", "unknown")),
+                    side=int(row.get("side", 0)),
+                    qty=float(row.get("qty", 0.0)),
+                    price=float(row.get("price", 0.0)),
+                    execution_pnl=float(row.get("execution_pnl_reporting", row.get("execution_pnl", 0.0))),
+                    inventory_pnl=float(row.get("inventory_pnl_reporting", row.get("inventory_pnl", 0.0))),
+                    hedge_pnl=float(row.get("hedge_pnl_reporting", row.get("hedge_pnl", 0.0))),
+                    source_trade_id=str(row.get("source_trade_id", "")) if row.get("source_trade_id") else None,
+                )
+                trades.append(trade)
+
+            return trades, total
+
+        except Exception as e:
+            logger.exception(f"Error getting trades for {run_id}")
+            return [], 0
 
     def _get_decrossed_data_dir(self, run: RunRecord) -> Path:
         """Get the decrossed data directory for a run.

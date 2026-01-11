@@ -15,6 +15,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from ...app.services.risk_metrics import RiskMetricsCalculator
 from ...core.config.run_config import RunConfig, RunStatus, SimulationConfig
 from ...core.data.run_models import RunSummary
 from ...core.data.run_registry import (
@@ -529,6 +530,8 @@ class RunOrchestrator:
         sorted_dates = sorted(dates)
         date_range = (sorted_dates[0], sorted_dates[-1]) if sorted_dates else None
 
+        total_pnl = total_exec_pnl + total_inv_pnl + total_hedge_pnl
+
         summary = RunSummary(
             run_id=run_id,
             status=RunStatus.COMPLETED,
@@ -538,7 +541,7 @@ class RunOrchestrator:
             total_execution_pnl=total_exec_pnl,
             total_inventory_pnl=total_inv_pnl,
             total_hedge_pnl=total_hedge_pnl,
-            total_pnl=total_exec_pnl + total_inv_pnl + total_hedge_pnl,
+            total_pnl=total_pnl,
             total_client_volume=total_client_volume,
             total_internalized_volume=total_internalized,
             total_externalized_volume=total_externalized,
@@ -549,6 +552,33 @@ class RunOrchestrator:
             ),
             pair_summaries=pair_summaries,
         )
+
+        # Phase 5: Calculate and attach risk metrics
+        try:
+            pnl_path = run_dir / "pnl_attribution.parquet"
+            calculator = RiskMetricsCalculator()
+
+            # Get simulation config for risk band threshold
+            run = self.registry.get_run(run_id)
+            sim_config = run.config.simulation_config
+
+            risk, ops, internalization = calculator.calculate_all(
+                pnl_path=pnl_path,
+                config=sim_config,
+                client_volume=total_client_volume,
+                total_pnl=total_pnl,
+            )
+            frontier = calculator.compute_frontier_scores(summary, risk)
+
+            summary.risk_metrics = risk
+            summary.ops_metrics = ops
+            summary.internalization_metrics = internalization
+            summary.frontier_scores = frontier
+
+            logger.info(f"Computed risk metrics for run {run_id}")
+        except Exception as e:
+            logger.warning(f"Failed to compute risk metrics for run {run_id}: {e}")
+            # Continue without risk metrics - they're optional
 
         self.registry.write_summary(run_id, summary)
 

@@ -114,7 +114,7 @@ data/*.parquet
 data/*.csv
 
 # Results (generated, user-specific)
-results/
+/results/
 
 # Environment files with secrets
 .env

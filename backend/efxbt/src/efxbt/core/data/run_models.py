@@ -7,6 +7,135 @@ from pydantic import BaseModel, Field
 from ..config.run_config import RunConfig, RunStatus
 
 
+# -----------------------------------------------------------------------------
+# Phase 5: Risk, Ops, and Internalization Metrics
+# -----------------------------------------------------------------------------
+
+
+class RiskMetrics(BaseModel):
+    """Risk metrics for a completed run.
+
+    All metrics are computed from the simulation's inventory and PnL timeseries.
+    """
+
+    # Inventory Risk
+    max_abs_inventory: float = Field(
+        ..., description="Peak absolute position across all timestamps (base currency)"
+    )
+    inventory_p95: float = Field(
+        ..., description="95th percentile of absolute position (base currency)"
+    )
+    inventory_p99: float = Field(
+        ..., description="99th percentile of absolute position (base currency)"
+    )
+
+    # Drawdown
+    max_drawdown: float = Field(
+        ..., description="Maximum peak-to-trough cumulative PnL drop (reporting currency)"
+    )
+    max_drawdown_pct: float = Field(
+        ..., description="Max drawdown as percentage of peak PnL"
+    )
+
+    # Interval Risk (5-minute intervals)
+    worst_interval_pnl: float = Field(
+        ..., description="Worst 5-minute period PnL (reporting currency)"
+    )
+    worst_interval_start_ms: int = Field(
+        ..., description="Start timestamp of worst interval (ms since epoch)"
+    )
+
+    # Time-Based Risk
+    time_above_risk_band_pct: float = Field(
+        ..., description="Percentage of time position exceeded risk band threshold"
+    )
+
+    # Efficient Frontier Score
+    cvar_95: float = Field(
+        ..., description="Conditional VaR at 95% - average of worst 5% of intervals"
+    )
+
+    # Per-pair breakdown (optional)
+    pair_risk: list[dict[str, Any]] = Field(
+        default_factory=list, description="Risk metrics broken down by pair"
+    )
+
+
+class OpsMetrics(BaseModel):
+    """Operational metrics for a completed run.
+
+    Tracks hedge execution statistics and efficiency.
+    """
+
+    hedge_count: int = Field(..., description="Total number of hedge trades executed")
+    total_hedge_volume: float = Field(
+        ..., description="Sum of all hedge trade quantities (base currency)"
+    )
+    hedge_volume_ratio: float = Field(
+        ..., description="Ratio of hedge volume to client volume"
+    )
+    avg_hedge_size: float = Field(
+        ..., description="Average hedge trade size (base currency)"
+    )
+
+    # Per-pair breakdown (optional)
+    pair_ops: list[dict[str, Any]] = Field(
+        default_factory=list, description="Ops metrics broken down by pair"
+    )
+
+
+class InternalizationMetrics(BaseModel):
+    """Detailed internalization breakdown for a completed run.
+
+    Internalization = volume matched between opposing client trades.
+    Externalization = volume covered by hedging to the market.
+    """
+
+    total_client_volume: float = Field(
+        ..., description="Total client trade volume (base currency)"
+    )
+    total_internalized_volume: float = Field(
+        ..., description="Volume internalized between clients (base currency)"
+    )
+    total_externalized_volume: float = Field(
+        ..., description="Volume hedged externally (base currency)"
+    )
+    internalization_ratio: float = Field(
+        ..., description="Internalized / total client volume (0.0 to 1.0)"
+    )
+
+    # Per-pair breakdown
+    pair_breakdown: list[dict[str, Any]] = Field(
+        default_factory=list, description="Internalization by currency pair"
+    )
+
+
+class EfficientFrontierScores(BaseModel):
+    """Scalar scores for efficient frontier analysis and run comparison.
+
+    These scores enable quick comparison of runs on a risk-return basis.
+    """
+
+    # Return Metrics (higher = better)
+    total_pnl: float = Field(..., description="Total PnL (reporting currency)")
+    pnl_per_volume_bps: float = Field(
+        ..., description="PnL per unit volume in basis points (total_pnl / client_volume * 10000)"
+    )
+
+    # Risk Metrics (lower = better)
+    max_drawdown_pct: float = Field(
+        ..., description="Maximum drawdown as percentage of peak"
+    )
+    inventory_risk_score: float = Field(
+        ..., description="Composite risk score from P99 inventory and time above band"
+    )
+
+    # Composite Score
+    risk_adjusted_return: float = Field(
+        ..., description="PnL per volume divided by inventory risk score"
+    )
+
+
 class ShardProgress(BaseModel):
     """Progress tracking for a single shard."""
 
@@ -137,6 +266,20 @@ class RunSummary(BaseModel):
     # Per-pair breakdown
     pair_summaries: list[dict[str, Any]] = Field(default_factory=list)
 
+    # Phase 5: Extended metrics (optional for backwards compatibility)
+    risk_metrics: RiskMetrics | None = Field(
+        default=None, description="Risk metrics (inventory, drawdown, CVaR)"
+    )
+    ops_metrics: OpsMetrics | None = Field(
+        default=None, description="Operational metrics (hedge count, volume ratio)"
+    )
+    internalization_metrics: InternalizationMetrics | None = Field(
+        default=None, description="Detailed internalization breakdown"
+    )
+    frontier_scores: EfficientFrontierScores | None = Field(
+        default=None, description="Scalar scores for efficient frontier analysis"
+    )
+
 
 class TimeseriesPoint(BaseModel):
     """Single point in downsampled time series."""
@@ -178,3 +321,73 @@ class CancelResponse(BaseModel):
     run_id: str
     cancelled: bool
     message: str | None = None
+
+
+# -----------------------------------------------------------------------------
+# Phase 5: API Response Models
+# -----------------------------------------------------------------------------
+
+
+class RiskMetricsResponse(BaseModel):
+    """Response model for risk metrics endpoint."""
+
+    run_id: str
+    risk: RiskMetrics | None = None
+    ops: OpsMetrics | None = None
+
+
+class InternalizationResponse(BaseModel):
+    """Response model for internalization metrics endpoint."""
+
+    run_id: str
+    metrics: InternalizationMetrics | None = None
+
+
+class TradeRecord(BaseModel):
+    """Single trade record for trades endpoint."""
+
+    timestamp_ms: int
+    pair: str
+    event_type: str  # "client_fill", "hedge_fill"
+    side: int
+    qty: float
+    price: float
+    execution_pnl: float
+    inventory_pnl: float
+    hedge_pnl: float
+    source_trade_id: str | None = None
+
+
+class TradesResponse(BaseModel):
+    """Response model for paginated trades endpoint."""
+
+    run_id: str
+    trades: list[TradeRecord]
+    total: int
+    limit: int
+    offset: int
+
+
+class RunComparisonResponse(BaseModel):
+    """Response model for run comparison endpoint."""
+
+    runs: list[EfficientFrontierScores]
+    run_ids: list[str]
+
+
+class KPIDefinition(BaseModel):
+    """Definition of a single KPI for tooltips and documentation."""
+
+    id: str
+    name: str
+    category: str  # "pnl", "risk", "ops", "internalization"
+    description: str
+    formula: str | None = None
+    unit: str
+    interpretation: str  # "higher_better", "lower_better", "neutral"
+
+
+class KPIDefinitionsResponse(BaseModel):
+    """Response model for KPI definitions endpoint."""
+
+    definitions: list[KPIDefinition]

@@ -5,9 +5,15 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query
 
 from ....core.data.run_models import (
+    InternalizationResponse,
+    KPIDefinitionsResponse,
     PnLBreakdownResponse,
+    RiskMetricsResponse,
+    RunComparisonResponse,
     RunSummary,
     TimeseriesResponse,
+    TradeRecord,
+    TradesResponse,
 )
 from ....core.data.run_registry import (
     InvalidRunStateError as RegistryInvalidRunStateError,
@@ -15,11 +21,11 @@ from ....core.data.run_registry import (
 from ....core.data.run_registry import (
     RunNotFoundError as RegistryRunNotFoundError,
 )
+from ....core.kpi import KPI_REGISTRY
 from ...services.runs import RunService
 from ..deps import get_runs_service
 from ..errors import (
     InvalidRunStateError,
-    NotImplementedError,
     RunNotFoundError,
 )
 
@@ -90,39 +96,111 @@ async def get_pnl_breakdown(
 
 
 @router.get("/{run_id}/risk")
-async def get_risk_metrics(run_id: str) -> None:
+async def get_risk_metrics(
+    run_id: str,
+    service: RunServiceDep,
+) -> RiskMetricsResponse:
     """Get risk metrics for a run.
+
+    Returns inventory peaks, time above band, drawdowns, CVaR, and
+    operational metrics like hedge count and volume ratio.
 
     Args:
         run_id: Unique run identifier
+        service: Run service instance
 
-    Returns inventory peaks, time above band, drawdowns, etc.
+    Returns:
+        RiskMetricsResponse with risk and ops metrics
+
+    Raises:
+        404: Run not found
+        409: Run not completed
     """
-    raise NotImplementedError(f"/api/v1/results/{run_id}/risk")
+    try:
+        summary = service.get_summary(run_id)
+        return RiskMetricsResponse(
+            run_id=run_id,
+            risk=summary.risk_metrics,
+            ops=summary.ops_metrics,
+        )
+    except RegistryRunNotFoundError:
+        raise RunNotFoundError(run_id)
+    except RegistryInvalidRunStateError as e:
+        raise InvalidRunStateError(run_id, str(e.current_status), str(e))
 
 
 @router.get("/{run_id}/internalization")
-async def get_internalization_metrics(run_id: str) -> None:
+async def get_internalization_metrics(
+    run_id: str,
+    service: RunServiceDep,
+) -> InternalizationResponse:
     """Get internalization metrics for a run.
+
+    Returns detailed internalized vs externalized volume breakdown,
+    including per-pair analysis.
 
     Args:
         run_id: Unique run identifier
+        service: Run service instance
 
-    Returns internalized vs externalized volume breakdown.
+    Returns:
+        InternalizationResponse with detailed breakdown
+
+    Raises:
+        404: Run not found
+        409: Run not completed
     """
-    raise NotImplementedError(f"/api/v1/results/{run_id}/internalization")
+    try:
+        summary = service.get_summary(run_id)
+        return InternalizationResponse(
+            run_id=run_id,
+            metrics=summary.internalization_metrics,
+        )
+    except RegistryRunNotFoundError:
+        raise RunNotFoundError(run_id)
+    except RegistryInvalidRunStateError as e:
+        raise InvalidRunStateError(run_id, str(e.current_status), str(e))
 
 
 @router.get("/{run_id}/trades")
-async def get_trades(run_id: str) -> None:
+async def get_trades(
+    run_id: str,
+    service: RunServiceDep,
+    limit: int = Query(default=100, ge=1, le=1000, description="Max trades to return"),
+    offset: int = Query(default=0, ge=0, description="Offset for pagination"),
+    pair: str | None = Query(default=None, description="Filter by currency pair"),
+) -> TradesResponse:
     """Get trade-level details for a run.
+
+    Returns paginated list of all trades with PnL attribution.
 
     Args:
         run_id: Unique run identifier
+        service: Run service instance
+        limit: Maximum number of trades to return
+        offset: Pagination offset
+        pair: Optional pair filter (e.g., "EURUSD")
 
-    Returns list of all trades with attribution.
+    Returns:
+        TradesResponse with paginated trade records
+
+    Raises:
+        404: Run not found
+        409: Run not completed
     """
-    raise NotImplementedError(f"/api/v1/results/{run_id}/trades")
+    try:
+        trades, total = service.get_trades(run_id, limit=limit, offset=offset, pair=pair)
+        return TradesResponse(
+            run_id=run_id,
+            trades=trades,
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
+    except RegistryRunNotFoundError:
+        raise RunNotFoundError(run_id)
+    except RegistryInvalidRunStateError as e:
+        raise InvalidRunStateError(run_id, str(e.current_status), str(e))
 
 
 @router.get("/{run_id}/timeseries")
