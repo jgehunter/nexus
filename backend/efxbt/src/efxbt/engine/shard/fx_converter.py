@@ -2,9 +2,16 @@
 
 Handles conversion of PnL from native currency (quote currency of each pair)
 to a single reporting currency for aggregation.
+
+Supports both direct pair conversion (GBPUSD for GBP->USD) and triangulated
+conversion paths (SEK->EUR->USD via EURSEK + EURUSD) when direct pairs aren't
+available in the market dataset.
 """
 
 from ...core.config.universe import get_quote_currency
+from ...core.graph.currency_graph import CurrencyGraphBuilder
+from ...core.graph.pathfinding import PathFinder
+from ...core.graph.schemas import CurrencyPath
 
 
 class FXConverter:
@@ -18,6 +25,9 @@ class FXConverter:
 
     For aggregation, all PnL must be converted to a single reporting currency.
     """
+
+    # Class-level cache for currency graphs (keyed by frozen set of available pairs)
+    _graph_cache: dict[frozenset, "CurrencyGraph"] = {}
 
     def __init__(self, reporting_currency: str):
         """Initialize converter.
@@ -105,6 +115,115 @@ class FXConverter:
         else:
             # Native alphabetically after reporting: use inverted pair
             return (inverted_pair, True)
+
+    def get_conversion_path(
+        self,
+        pair: str,
+        available_pairs: list[str],
+    ) -> CurrencyPath | None:
+        """Find conversion path using available market pairs.
+
+        Uses pathfinding to find a route from native currency to reporting
+        currency when a direct conversion pair isn't available.
+
+        Args:
+            pair: Currency pair whose PnL needs conversion
+            available_pairs: List of pairs available in the market dataset
+
+        Returns:
+            CurrencyPath with pairs and inversions, or None if no conversion needed
+
+        Example:
+            # When SEKUSD doesn't exist but EURSEK and EURUSD do:
+            >>> converter = FXConverter("USD")
+            >>> path = converter.get_conversion_path("EURSEK", ["EURSEK", "EURUSD"])
+            >>> path.currencies
+            ['SEK', 'EUR', 'USD']
+            >>> path.pairs
+            ['EURSEK', 'EURUSD']
+            >>> path.inversions
+            [True, False]  # EURSEK inverted to get SEK->EUR, EURUSD direct for EUR->USD
+        """
+        native = self.get_native_currency(pair)
+
+        if native == self.reporting_currency:
+            return None  # No conversion needed
+
+        # Build currency graph from available pairs (with caching)
+        cache_key = frozenset(available_pairs)
+        if cache_key not in FXConverter._graph_cache:
+            builder = CurrencyGraphBuilder(available_pairs)
+            FXConverter._graph_cache[cache_key] = builder.build_graph()
+        graph = FXConverter._graph_cache[cache_key]
+
+        # Check if both currencies exist in graph
+        graph_currencies = {node.currency for node in graph.nodes}
+        if native not in graph_currencies:
+            raise ValueError(
+                f"Native currency {native} not found in available pairs: {available_pairs}"
+            )
+        if self.reporting_currency not in graph_currencies:
+            raise ValueError(
+                f"Reporting currency {self.reporting_currency} not found in available pairs: {available_pairs}"
+            )
+
+        # Use pathfinder to find conversion route
+        priority_currencies = ["USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD"]
+        pathfinder = PathFinder(graph, priority_currencies)
+
+        path = pathfinder.find_path(native, self.reporting_currency, max_path_length=4)
+
+        if path is None:
+            raise ValueError(
+                f"No conversion path found from {native} to {self.reporting_currency} "
+                f"using available pairs: {available_pairs}"
+            )
+
+        return path
+
+    @staticmethod
+    def calculate_chained_fx_rate(
+        rates: list[float],
+        inversions: list[bool],
+    ) -> float:
+        """Calculate combined FX rate from a chain of conversions.
+
+        For a conversion path like SEK -> EUR -> USD with rates from
+        EURSEK and EURUSD, this computes the final SEK -> USD rate.
+
+        Args:
+            rates: List of mid prices for each pair in the path
+            inversions: Whether each rate needs inversion
+
+        Returns:
+            Combined FX rate for converting native to reporting currency
+
+        Example:
+            # SEK -> EUR -> USD via [EURSEK, EURUSD]
+            # EURSEK = 11.50 (1 EUR = 11.50 SEK)
+            # EURUSD = 1.08 (1 EUR = 1.08 USD)
+            # SEK -> EUR: 1/11.50 = 0.0869 (need to invert EURSEK)
+            # EUR -> USD: 1.08 (use EURUSD directly)
+            # SEK -> USD: 0.0869 * 1.08 = 0.0939
+            >>> FXConverter.calculate_chained_fx_rate([11.50, 1.08], [True, False])
+            0.0939...
+        """
+        if len(rates) != len(inversions):
+            raise ValueError("rates and inversions must have same length")
+
+        if not rates:
+            return 1.0
+
+        result = 1.0
+        for rate, is_inverted in zip(rates, inversions):
+            if rate == 0:
+                return 0.0
+            if is_inverted:
+                result *= 1.0 / rate
+            else:
+                result *= rate
+
+        return result
 
     def convert_pnl(
         self,

@@ -34,7 +34,7 @@ export function RunProgress({ runId, autoStart = false, onBack, onComplete }: Ru
       try {
         const response = await startRun(runId)
         setStatus(response)
-        startTimeRef.current = Date.now()
+        startTimeRef.current = response.started_at_ms || Date.now()
         setLoading(false)
       } catch (err) {
         console.error('Failed to start run:', err)
@@ -44,6 +44,27 @@ export function RunProgress({ runId, autoStart = false, onBack, onComplete }: Ru
     }
 
     start()
+  }, [runId, autoStart])
+
+  // Fetch initial status when viewing existing run (not auto-starting)
+  useEffect(() => {
+    if (autoStart) return  // autoStart effect handles this case
+
+    async function fetchInitialStatus() {
+      try {
+        const response = await getRunStatus(runId)
+        setStatus(response)
+        if (response.started_at_ms) {
+          startTimeRef.current = response.started_at_ms
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to fetch run status')
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    fetchInitialStatus()
   }, [runId, autoStart])
 
   // Poll for status updates
@@ -179,25 +200,63 @@ export function RunProgress({ runId, autoStart = false, onBack, onComplete }: Ru
           )}
         </div>
 
-        {status.status === 'running' && (
-          <div className="progress-bar-container">
-            <div className="progress-bar-large">
-              <div
-                className="progress-fill"
-                style={{ width: `${status.progress_pct}%` }}
-              />
-            </div>
-            <div className="progress-stats">
-              <span className="progress-pct">{status.progress_pct.toFixed(1)}%</span>
-              <span className="progress-shards">
-                {status.completed_shards} / {status.total_shards} shards
-              </span>
-              {status.failed_shards > 0 && (
-                <span className="progress-failed">
-                  ({status.failed_shards} failed)
+        {/* Decrossing phase progress */}
+        {status.status === 'running' && status.decross_status === 'running' && (
+          <div className="progress-phase">
+            <h4>Phase 1: Decrossing Trades</h4>
+            <div className="progress-bar-container">
+              <div className="progress-bar-large">
+                <div
+                  className="progress-fill decross-fill"
+                  style={{ width: `${status.decross_progress_pct}%` }}
+                />
+              </div>
+              <div className="progress-stats">
+                <span className="progress-pct">{status.decross_progress_pct.toFixed(1)}%</span>
+                <span className="progress-shards">
+                  {status.decross_completed_dates} / {status.decross_total_dates} dates
                 </span>
-              )}
+                {status.decross_current_date && (
+                  <span className="progress-current">
+                    Processing: {status.decross_current_date}
+                  </span>
+                )}
+              </div>
             </div>
+          </div>
+        )}
+
+        {/* Shard simulation phase progress */}
+        {status.status === 'running' && (status.decross_status === 'completed' || status.total_shards > 0) && (
+          <div className="progress-phase">
+            {status.decross_status === 'completed' && <h4>Phase 2: Running Simulation</h4>}
+            <div className="progress-bar-container">
+              <div className="progress-bar-large">
+                <div
+                  className="progress-fill"
+                  style={{ width: `${status.progress_pct}%` }}
+                />
+              </div>
+              <div className="progress-stats">
+                <span className="progress-pct">{status.progress_pct.toFixed(1)}%</span>
+                <span className="progress-shards">
+                  {status.completed_shards} / {status.total_shards} shards
+                </span>
+                {status.failed_shards > 0 && (
+                  <span className="progress-failed">
+                    ({status.failed_shards} failed)
+                  </span>
+                )}
+              </div>
+            </div>
+            {/* Show current stage when shards are complete but run is still processing */}
+            {status.progress_pct >= 100 && status.current_stage && (
+              <div className="stage-indicator">
+                {status.current_stage === 'computing_metrics' && 'Computing risk metrics...'}
+                {status.current_stage === 'writing_results' && 'Writing results...'}
+                {status.current_stage === 'simulating' && 'Finalizing simulation...'}
+              </div>
+            )}
           </div>
         )}
 

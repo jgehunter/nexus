@@ -94,7 +94,7 @@ export function PnLChart({ data, height = 300 }: PnLChartProps) {
           <Tooltip content={<CustomTooltip />} />
           <ReferenceLine y={0} stroke="#30363d" strokeDasharray="3 3" />
           <Line
-            type="monotone"
+            type="stepAfter"
             dataKey="cumulative_pnl"
             stroke={lineColor}
             strokeWidth={2}

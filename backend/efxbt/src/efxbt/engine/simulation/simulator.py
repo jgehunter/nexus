@@ -4,6 +4,7 @@ Orchestrates simulation across multiple (date, pair) shards, chains state
 across dates for continuity, and aggregates results.
 """
 
+import gc
 from pathlib import Path
 
 import pyarrow as pa
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from ...core.config.run_config import SimulationConfig
 from ...core.data.schemas import DecrossedTradeRecord
+from ..io.pnl_writer import StreamingPnLWriter
 from ..shard.shard_engine import ShardEngine, ShardResult
 from ..shard.state import PnLAttributionRecord, ShardState
 from .metrics import MetricsCalculator
@@ -114,44 +116,53 @@ class MultiShardSimulator:
             shards_by_pair[pair].append(shard)
 
         # Step 3: Run shards sequentially per pair (maintain state)
+        # Use streaming writer to avoid accumulating all records in memory
         all_results: list[ShardResult] = []
-        all_pnl_records: list[PnLAttributionRecord] = []
+        output_dir.mkdir(parents=True, exist_ok=True)
+        pnl_output_path = output_dir / "pnl_attribution.parquet"
 
-        for pair, pair_shards in shards_by_pair.items():
-            # Sort by date for chronological processing
-            pair_shards.sort(key=lambda s: s["date"])
+        with StreamingPnLWriter(pnl_output_path, buffer_size=10000) as writer:
+            for pair, pair_shards in shards_by_pair.items():
+                # Sort by date for chronological processing
+                pair_shards.sort(key=lambda s: s["date"])
 
-            prior_state: ShardState | None = None
+                prior_state: ShardState | None = None
+                prior_queue_numpy = None  # Efficient numpy queue for chaining
 
-            for shard_info in pair_shards:
-                # Load client trades for this shard
-                client_trades = self._load_shard_trades(shard_info["file_path"])
+                for shard_info in pair_shards:
+                    # Load client trades for this shard
+                    client_trades = self._load_shard_trades(shard_info["file_path"])
 
-                # Create shard engine
-                engine = ShardEngine(
-                    pair=pair,
-                    date=shard_info["date"],
-                    config=self.config,
-                    data_root=self.data_root,
-                )
+                    # Create shard engine
+                    engine = ShardEngine(
+                        pair=pair,
+                        date=shard_info["date"],
+                        config=self.config,
+                        data_root=self.data_root,
+                    )
 
-                # Run simulation with prior state
-                result = engine.run(client_trades, prior_state)
+                    # Run simulation with prior state and numpy queue (avoids Pydantic conversion)
+                    result = engine.run(client_trades, prior_state, prior_queue_numpy)
 
-                # Collect results
-                all_results.append(result)
-                all_pnl_records.extend(result.pnl_records)
+                    # Collect shard result (for metrics aggregation)
+                    all_results.append(result)
 
-                # Chain state to next day
-                prior_state = result.final_state
+                    # Stream PnL records to disk instead of accumulating
+                    writer.write_records(result.pnl_records)
+
+                    # Chain state to next day (keep both Pydantic and numpy for efficiency)
+                    prior_state = result.final_state
+                    prior_queue_numpy = result.fifo_queue_numpy
+
+                    # Explicit cleanup to release memory between shards
+                    del client_trades
+                    del result
+                    gc.collect()
 
         # Step 4: Aggregate results
         aggregated = self._aggregate_results(all_results)
         aggregated.output_dir = output_dir
-
-        # Step 5: Write results
-        self._write_results(all_pnl_records, output_dir)
-        aggregated.pnl_attribution_path = output_dir / "pnl_attribution.parquet"
+        aggregated.pnl_attribution_path = pnl_output_path
 
         return aggregated
 
@@ -201,6 +212,8 @@ class MultiShardSimulator:
     def _load_shard_trades(self, file_path: Path) -> list[DecrossedTradeRecord]:
         """Load decrossed trades for a single shard.
 
+        Uses batch construction for efficiency (no per-row validation).
+
         Args:
             file_path: Path to decrossed trades parquet file
 
@@ -208,13 +221,7 @@ class MultiShardSimulator:
             List of DecrossedTradeRecord objects
         """
         table = pq.read_table(file_path)
-        records = []
-
-        for batch in table.to_batches():
-            for row in batch.to_pylist():
-                records.append(DecrossedTradeRecord(**row))
-
-        return records
+        return DecrossedTradeRecord.batch_from_table(table)
 
     def _aggregate_results(self, all_results: list[ShardResult]) -> SimulationResult:
         """Aggregate metrics and PnL across all shards.
@@ -284,62 +291,3 @@ class MultiShardSimulator:
             shard_results=shard_results,
         )
 
-    def _write_results(
-        self, all_pnl_records: list[PnLAttributionRecord], output_dir: Path
-    ) -> None:
-        """Write PnL attribution records to parquet.
-
-        Args:
-            all_pnl_records: All PnL attribution records from all shards
-            output_dir: Directory to write results
-
-        Writes:
-            output_dir/pnl_attribution.parquet - All trade-level PnL attributions
-        """
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        if not all_pnl_records:
-            # Write empty file
-            empty_table = pa.table({})
-            pq.write_table(empty_table, output_dir / "pnl_attribution.parquet")
-            return
-
-        # Flatten PnL attribution records to rows
-        rows = []
-        for record in all_pnl_records:
-            for trade_attr in record.trade_attributions:
-                rows.append(
-                    {
-                        "timestamp_ms": trade_attr.timestamp_ms,
-                        "event_type": trade_attr.event_type,
-                        "source_trade_id": trade_attr.source_trade_id,
-                        "pair": trade_attr.pair,
-                        "native_currency": trade_attr.native_currency,
-                        "reporting_currency": trade_attr.reporting_currency,
-                        "fx_rate": trade_attr.fx_rate,
-                        "execution_pnl_native": trade_attr.execution_pnl_native,
-                        "inventory_pnl_native": trade_attr.inventory_pnl_native,
-                        "hedge_pnl_native": trade_attr.hedge_pnl_native,
-                        "unrealized_pnl_native": trade_attr.unrealized_pnl_native,
-                        "execution_pnl_reporting": trade_attr.execution_pnl_reporting,
-                        "inventory_pnl_reporting": trade_attr.inventory_pnl_reporting,
-                        "hedge_pnl_reporting": trade_attr.hedge_pnl_reporting,
-                        "unrealized_pnl_reporting": trade_attr.unrealized_pnl_reporting,
-                        "triggered_hedge": trade_attr.triggered_hedge,
-                        "hedge_allocation_pct": trade_attr.hedge_allocation_pct,
-                        # Metadata fields (extensible)
-                        "order_id": trade_attr.metadata.get("order_id"),
-                        "is_direct": trade_attr.metadata.get("is_direct"),
-                        "path": trade_attr.metadata.get("path"),
-                    }
-                )
-
-        # Create PyArrow table
-        table = pa.Table.from_pylist(rows)
-
-        # Write to parquet with compression
-        pq.write_table(
-            table,
-            output_dir / "pnl_attribution.parquet",
-            compression="snappy",
-        )

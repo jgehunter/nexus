@@ -35,22 +35,31 @@ export function Datasets() {
     }
 
     async function fetchHealth(datasets: DatasetSummary[]) {
-      setHealthLoading(true)
-      const reports = new Map<string, DataHealthReport>()
+      if (datasets.length === 0) return
 
-      for (const dataset of datasets) {
+      setHealthLoading(true)
+
+      // Fetch health reports in parallel instead of sequentially
+      const healthPromises = datasets.map(async (dataset) => {
         try {
           const health = await getDatasetHealth(dataset.name, false)
-          if (mounted) {
-            reports.set(dataset.name, health)
-            setHealthReports(new Map(reports))
-          }
+          return { name: dataset.name, health, error: null }
         } catch (err) {
           console.error(`Failed to load health for ${dataset.name}:`, err)
+          return { name: dataset.name, health: null, error: err }
         }
-      }
+      })
+
+      const results = await Promise.all(healthPromises)
 
       if (mounted) {
+        const reports = new Map<string, DataHealthReport>()
+        for (const result of results) {
+          if (result.health) {
+            reports.set(result.name, result.health)
+          }
+        }
+        setHealthReports(reports)
         setHealthLoading(false)
       }
     }

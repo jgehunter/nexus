@@ -251,6 +251,11 @@ class FIFOMatcher:
             qty = trade.qty
             timestamp_ms = trade.timestamp_ms
 
+        # Side is always from house's perspective:
+        # +1 = house BUYS base currency (going long)
+        # -1 = house SELLS base currency (going short)
+        # Both client trades and hedge trades now use this convention.
+
         # Call Numba hot loop
         updated_queue, inv_pnl, matched_slices = fifo_match_and_pnl_attributed(
             self.queue,

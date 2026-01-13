@@ -4,6 +4,8 @@
 
 import type { RiskMetrics, KPIDefinition } from '../../api/results'
 import { KPICard } from './KPICard'
+import { CombinedPositionChart } from './CombinedPositionChart'
+import { AggregatePositionChart } from './AggregatePositionChart'
 
 interface RiskPanelProps {
   metrics: RiskMetrics | null
@@ -19,16 +21,6 @@ function formatCurrency(value: number): string {
     return `${value >= 0 ? '' : '-'}$${(absValue / 1000).toFixed(1)}K`
   }
   return `${value >= 0 ? '' : '-'}$${absValue.toFixed(2)}`
-}
-
-function formatNumber(value: number): string {
-  if (value >= 1000000) {
-    return `${(value / 1000000).toFixed(2)}M`
-  }
-  if (value >= 1000) {
-    return `${(value / 1000).toFixed(1)}K`
-  }
-  return value.toFixed(0)
 }
 
 function formatPercent(value: number): string {
@@ -55,36 +47,29 @@ export function RiskPanel({ metrics, definitions }: RiskPanelProps) {
       <div className="panel-section">
         <h3 className="panel-section-title">Inventory Risk</h3>
         <p className="panel-section-description">
-          Measures of position size and exposure throughout the simulation.
+          Aggregate USD exposure across all direct currency pairs.
         </p>
         <div className="panel-metrics">
           <KPICard
             label="Peak Position"
-            value={formatNumber(metrics.max_abs_inventory)}
-            subtitle="Maximum absolute inventory"
-            trend={metrics.max_abs_inventory > 5000 ? 'warning' : 'neutral'}
+            value={formatCurrency(metrics.max_abs_inventory)}
+            subtitle="Maximum aggregate USD exposure"
+            trend={metrics.max_abs_inventory > 50000 ? 'warning' : 'neutral'}
             definition={definitions['max_abs_inventory']}
           />
           <KPICard
             label="Position P95"
-            value={formatNumber(metrics.inventory_p95)}
-            subtitle="95th percentile"
+            value={formatCurrency(metrics.inventory_p95)}
+            subtitle="95th percentile (USD)"
             trend="neutral"
             definition={definitions['inventory_p95']}
           />
           <KPICard
             label="Position P99"
-            value={formatNumber(metrics.inventory_p99)}
+            value={formatCurrency(metrics.inventory_p99)}
             subtitle="99th percentile (tail risk)"
             trend={metrics.inventory_p99 > metrics.inventory_p95 * 1.5 ? 'warning' : 'neutral'}
             definition={definitions['inventory_p99']}
-          />
-          <KPICard
-            label="Time Above Band"
-            value={formatPercent(metrics.time_above_risk_band_pct)}
-            subtitle="% time exceeding threshold"
-            trend={metrics.time_above_risk_band_pct > 20 ? 'warning' : 'positive'}
-            definition={definitions['time_above_risk_band_pct']}
           />
         </div>
       </div>
@@ -134,6 +119,28 @@ export function RiskPanel({ metrics, definitions }: RiskPanelProps) {
           />
         </div>
       </div>
+
+      {/* Aggregate Position Timeseries */}
+      {metrics.aggregate_position_timeseries && metrics.aggregate_position_timeseries.points.length > 0 && (
+        <div className="panel-section">
+          <h3 className="panel-section-title">Total USD Exposure Over Time</h3>
+          <p className="panel-section-description">
+            Sum of absolute USD positions across all direct pairs at each point in time.
+          </p>
+          <AggregatePositionChart data={metrics.aggregate_position_timeseries} height={250} />
+        </div>
+      )}
+
+      {/* Combined Position Timeseries Chart */}
+      {metrics.position_timeseries && metrics.position_timeseries.length > 0 && (
+        <div className="panel-section">
+          <h3 className="panel-section-title">Net Position by Currency Pair</h3>
+          <p className="panel-section-description">
+            Net position over time for each direct currency pair. Toggle pairs on/off to compare.
+          </p>
+          <CombinedPositionChart positionTimeseries={metrics.position_timeseries} height={400} />
+        </div>
+      )}
     </div>
   )
 }

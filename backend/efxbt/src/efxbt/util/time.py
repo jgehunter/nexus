@@ -18,12 +18,18 @@ def now_ms() -> int:
 def ms_to_datetime(timestamp_ms: int) -> datetime:
     """Convert milliseconds timestamp to datetime.
 
+    Handles both millisecond (13 digits) and microsecond (16 digits) timestamps,
+    auto-detecting based on magnitude.
+
     Args:
-        timestamp_ms: Timestamp in milliseconds since Unix epoch
+        timestamp_ms: Timestamp in milliseconds (or microseconds) since Unix epoch
 
     Returns:
         UTC datetime object
     """
+    # Handle microsecond timestamps (16 digits) by converting to milliseconds
+    if timestamp_ms > 9999999999999:  # More than 13 digits
+        timestamp_ms = timestamp_ms // 1000
     return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
 
 

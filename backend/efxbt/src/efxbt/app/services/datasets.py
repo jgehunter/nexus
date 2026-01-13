@@ -8,6 +8,8 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from ...core.cache.health_cache import get_health_cache
+from ...core.cache.registry_cache import get_registry_cache
 from ...core.data.market_health import (
     MarketDataHealthAnalyzer,
     MarketDataHealthReport,
@@ -65,19 +67,37 @@ class DatasetsService:
         """
         self.data_root = Path(data_root)
         self.registry = MarketDatasetRegistry(self.data_root)
+        self._registry_cache = get_registry_cache()
+        self._health_cache = get_health_cache()
 
     def list_datasets(self) -> list[DatasetSummary]:
         """List all available market datasets with summary info.
 
+        Uses caching to avoid repeated filesystem scans.
+
         Returns:
             List of market dataset summaries
         """
-        dataset_names = self.registry.list_datasets()
-        summaries = []
+        # Try cache first for the list
+        cached_names = self._registry_cache.get_dataset_list(
+            self.registry.datasets_dir
+        )
+        if cached_names is not None:
+            dataset_names = cached_names
+        else:
+            dataset_names = self.registry.list_datasets()
+            self._registry_cache.set_dataset_list(
+                self.registry.datasets_dir, dataset_names
+            )
 
+        summaries = []
         for name in dataset_names:
             try:
-                inventory = self.registry.discover_dataset(name)
+                # Try cache for individual inventory
+                inventory = self._registry_cache.get_dataset_inventory(name)
+                if inventory is None:
+                    inventory = self.registry.discover_dataset(name)
+                    self._registry_cache.set_dataset_inventory(name, inventory)
                 summaries.append(self._inventory_to_summary(inventory))
             except Exception:
                 # Skip datasets that fail to load
@@ -135,6 +155,8 @@ class DatasetsService:
     ) -> HealthReportResponse:
         """Compute health report for a market dataset.
 
+        Uses caching to avoid recomputing expensive health analysis.
+
         Args:
             dataset_name: Name of the dataset
             validate_schemas: Whether to validate parquet schemas
@@ -145,9 +167,30 @@ class DatasetsService:
         Raises:
             FileNotFoundError: If dataset does not exist
         """
-        inventory = self.registry.discover_dataset(dataset_name)
+        # Get inventory (with caching)
+        inventory = self._registry_cache.get_dataset_inventory(dataset_name)
+        if inventory is None:
+            inventory = self.registry.discover_dataset(dataset_name)
+            self._registry_cache.set_dataset_inventory(dataset_name, inventory)
+
+        # Try health cache (only for non-schema-validation requests)
+        # Schema validation is typically slower and less frequently needed
+        if not validate_schemas:
+            cached_report = self._health_cache.get_market_health(
+                dataset_name, inventory.version_id
+            )
+            if cached_report is not None:
+                return self._health_report_to_response(cached_report)
+
+        # Compute health report
         analyzer = MarketDataHealthAnalyzer(inventory)
         report = analyzer.compute_health_report(validate_schemas=validate_schemas)
+
+        # Cache the result (only if not validating schemas, as that's the common case)
+        if not validate_schemas:
+            self._health_cache.set_market_health(
+                dataset_name, inventory.version_id, report
+            )
 
         return self._health_report_to_response(report)
 

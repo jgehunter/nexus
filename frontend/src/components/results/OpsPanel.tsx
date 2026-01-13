@@ -72,19 +72,29 @@ export function OpsPanel({ metrics, definitions }: OpsPanelProps) {
         </div>
       </div>
 
-      {/* Visual indicator */}
+      {/* Hedge Efficiency metrics */}
       <div className="panel-section">
         <h3 className="panel-section-title">Hedge Efficiency</h3>
+        <p className="panel-section-description">
+          Operational efficiency metrics for hedging activity.
+        </p>
         <div className="ops-stats">
-          <div className="ops-stat">
-            <div className="ops-stat-label">Hedges per 1000 units client flow</div>
+          <div className="ops-stat" title="Number of hedge trades executed per $1 million of client flow. Lower values indicate more efficient batch hedging.">
+            <div className="ops-stat-label">Hedges per $1M client flow</div>
             <div className="ops-stat-value">
-              {metrics.hedge_count > 0 && metrics.total_hedge_volume > 0
-                ? ((metrics.hedge_count / metrics.total_hedge_volume) * 1000).toFixed(1)
+              {metrics.total_client_volume > 0
+                ? ((metrics.hedge_count / metrics.total_client_volume) * 1000000).toFixed(2)
                 : 'N/A'}
             </div>
+            <div className="ops-stat-description">
+              {metrics.hedge_count === 0
+                ? 'No hedges executed - full internalization'
+                : metrics.total_client_volume > 0 && (metrics.hedge_count / metrics.total_client_volume) * 1000000 < 1
+                ? 'Efficient batched hedging'
+                : 'Frequent hedging activity'}
+            </div>
           </div>
-          <div className="ops-stat">
+          <div className="ops-stat" title="Percentage of client flow that was hedged externally. Lower values indicate higher internalization.">
             <div className="ops-stat-label">Volume Coverage Ratio</div>
             <div className="ops-stat-value">
               {(metrics.hedge_volume_ratio * 100).toFixed(1)}%

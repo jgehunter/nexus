@@ -114,10 +114,12 @@ class TestShardEngineIntegration:
             sample_interval_seconds=30,
         )
 
-        # Create client trades
+        # Create client trades (all sides from HOUSE's perspective)
+        # side=-1: House SELLS (client buys from us)
+        # side=+1: House BUYS (client sells to us)
         client_trades = [
-            create_test_trade("T001", 1704110400000, 1, 500.0, 1.1005),  # BUY 500
-            create_test_trade("T002", 1704110430000, -1, 300.0, 1.0995),  # SELL 300
+            create_test_trade("T001", 1704110400000, -1, 500.0, 1.1005),  # House SELLS 500
+            create_test_trade("T002", 1704110430000, 1, 300.0, 1.0995),  # House BUYS 300
         ]
 
         # Run simulation
@@ -135,8 +137,9 @@ class TestShardEngineIntegration:
         assert result.date == "20240101"
         assert result.final_state is not None
 
-        # Net position should be +200 (500 - 300)
-        assert abs(result.final_state.net_position - 200.0) < 1e-8
+        # Net position: House SELLS 500 (side=-1) → -500, House BUYS 300 (side=+1) → +300
+        # Net = -500 + 300 = -200
+        assert abs(result.final_state.net_position - (-200.0)) < 1e-8
 
         # Should have PnL records
         assert len(result.pnl_records) > 0
@@ -161,8 +164,9 @@ class TestShardEngineIntegration:
         )
 
         # Create trades that exceed risk band
+        # House SELLS 1000 → position = -1000 (exceeds band of 500)
         client_trades = [
-            create_test_trade("T001", 1704110400000, 1, 1000.0, 1.1005),  # BUY 1000
+            create_test_trade("T001", 1704110400000, -1, 1000.0, 1.1005),  # House SELLS 1000
         ]
 
         engine = ShardEngine(
@@ -193,8 +197,9 @@ class TestShardEngineIntegration:
         )
 
         # Day 1: Build up position
+        # House SELLS 500 → position = -500
         day1_trades = [
-            create_test_trade("T001", 1704110400000, 1, 500.0, 1.1005),  # BUY 500
+            create_test_trade("T001", 1704110400000, -1, 500.0, 1.1005),  # House SELLS 500
         ]
 
         engine_day1 = ShardEngine(
@@ -206,12 +211,13 @@ class TestShardEngineIntegration:
 
         result_day1 = engine_day1.run(day1_trades, prior_state=None)
 
-        # Day 1 final position: +500
-        assert abs(result_day1.final_state.net_position - 500.0) < 1e-8
+        # Day 1 final position: -500 (House SELLS 500 → house is SHORT 500)
+        assert abs(result_day1.final_state.net_position - (-500.0)) < 1e-8
 
         # Day 2: Use day 1 final state as prior state
+        # House BUYS 300 → position goes from -500 to -200
         day2_trades = [
-            create_test_trade("T002", 1704110400000, -1, 300.0, 1.0995),  # SELL 300
+            create_test_trade("T002", 1704110400000, 1, 300.0, 1.0995),  # House BUYS 300
         ]
 
         engine_day2 = ShardEngine(
@@ -223,8 +229,8 @@ class TestShardEngineIntegration:
 
         result_day2 = engine_day2.run(day2_trades, prior_state=result_day1.final_state)
 
-        # Day 2 final position: +500 - 300 = +200
-        assert abs(result_day2.final_state.net_position - 200.0) < 1e-8
+        # Day 2 final position: -500 + 300 = -200 (House BUYS 300 → house +300)
+        assert abs(result_day2.final_state.net_position - (-200.0)) < 1e-8
 
         # Cumulative PnL should accumulate
         # Day 2 cumulative PnL = Day 1 cumulative + Day 2 incremental
@@ -240,8 +246,9 @@ class TestShardEngineIntegration:
             sample_interval_seconds=30,
         )
 
+        # House SELLS 800 → position = -800 (exceeds band of 500, triggers hedge)
         client_trades = [
-            create_test_trade("T001", 1704110400000, 1, 800.0, 1.1005),  # BUY 800 (triggers hedge)
+            create_test_trade("T001", 1704110400000, -1, 800.0, 1.1005),  # House SELLS 800
         ]
 
         engine = ShardEngine(
@@ -279,8 +286,9 @@ class TestShardEngineIntegration:
             sample_interval_seconds=30,
         )
 
+        # House SELLS 500 EURUSD
         client_trades = [
-            create_test_trade("T001", 1704110400000, 1, 500.0, 1.1005, "EURUSD"),
+            create_test_trade("T001", 1704110400000, -1, 500.0, 1.1005, "EURUSD"),
         ]
 
         engine = ShardEngine(
@@ -312,8 +320,9 @@ class TestShardEngineIntegration:
             sample_interval_seconds=30,
         )
 
+        # House SELLS 1000 → position = -1000 (exceeds band of 500)
         client_trades = [
-            create_test_trade("T001", 1704110400000, 1, 1000.0, 1.1005),  # BUY 1000
+            create_test_trade("T001", 1704110400000, -1, 1000.0, 1.1005),  # House SELLS 1000
         ]
 
         engine = ShardEngine(
@@ -325,9 +334,9 @@ class TestShardEngineIntegration:
 
         result = engine.run(client_trades, prior_state=None)
 
-        # Position should be hedged back to band edge (500)
-        # Original: +1000, hedge: -500, final: +500
-        assert abs(result.final_state.net_position - 500.0) < 1e-8
+        # Position should be hedged back to band edge (-500)
+        # House SELLS 1000 → position = -1000, hedge BUY 500 → position = -500
+        assert abs(result.final_state.net_position - (-500.0)) < 1e-8
 
         # Verify partial externalization
         assert result.metrics["total_hedge_volume"] == 500.0  # Partial hedge
@@ -368,8 +377,9 @@ class TestShardEngineIntegration:
         )
 
         # Create trade that leaves open position
+        # House SELLS 500 → position = -500 (stays open, within band)
         client_trades = [
-            create_test_trade("T001", 1704110400000, 1, 500.0, 1.1005),  # BUY 500 (stays open)
+            create_test_trade("T001", 1704110400000, -1, 500.0, 1.1005),  # House SELLS 500
         ]
 
         engine = ShardEngine(
@@ -436,8 +446,9 @@ class TestShardEngineErrorHandling:
             net_position=500.0,
         )
 
+        # House SELLS 500
         client_trades = [
-            create_test_trade("T001", 1704110400000, 1, 500.0, 1.1005),
+            create_test_trade("T001", 1704110400000, -1, 500.0, 1.1005),
         ]
 
         engine = ShardEngine(

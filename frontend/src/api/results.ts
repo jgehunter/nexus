@@ -8,6 +8,29 @@ import { apiGet } from './client'
 // Type Definitions
 // -----------------------------------------------------------------------------
 
+export interface PositionTimeseriesPoint {
+  timestamp_ms: number
+  position: number
+  position_usd: number
+}
+
+export interface PairPositionTimeseries {
+  pair: string
+  points: PositionTimeseriesPoint[]
+  max_position: number
+  max_position_usd: number
+}
+
+export interface AggregatePositionTimeseriesPoint {
+  timestamp_ms: number
+  total_abs_position_usd: number
+}
+
+export interface AggregatePositionTimeseries {
+  points: AggregatePositionTimeseriesPoint[]
+  max_total_abs_position_usd: number
+}
+
 export interface RiskMetrics {
   max_abs_inventory: number
   inventory_p95: number
@@ -16,9 +39,10 @@ export interface RiskMetrics {
   max_drawdown_pct: number
   worst_interval_pnl: number
   worst_interval_start_ms: number
-  time_above_risk_band_pct: number
   cvar_95: number
   pair_risk: Record<string, unknown>[]
+  position_timeseries: PairPositionTimeseries[]
+  aggregate_position_timeseries: AggregatePositionTimeseries | null
 }
 
 export interface OpsMetrics {
@@ -26,14 +50,31 @@ export interface OpsMetrics {
   total_hedge_volume: number
   hedge_volume_ratio: number
   avg_hedge_size: number
+  total_client_volume: number
   pair_ops: Record<string, unknown>[]
 }
 
+export interface DirectPairInternalization {
+  pair: string
+  client_volume_usd: number
+  internalized_volume_usd: number
+  externalized_volume_usd: number
+  internalization_ratio: number
+}
+
 export interface InternalizationMetrics {
+  // USD-normalized aggregate metrics
+  total_client_volume_usd: number
+  total_internalized_volume_usd: number
+  total_externalized_volume_usd: number
+  internalization_ratio: number
+  // Legacy fields (base currency)
   total_client_volume: number
   total_internalized_volume: number
   total_externalized_volume: number
-  internalization_ratio: number
+  // Direct pair breakdown (USD-normalized)
+  direct_pair_breakdown: DirectPairInternalization[]
+  // Legacy pair breakdown
   pair_breakdown: Record<string, unknown>[]
 }
 

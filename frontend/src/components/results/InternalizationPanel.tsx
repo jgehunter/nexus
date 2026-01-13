@@ -10,14 +10,15 @@ interface InternalizationPanelProps {
   definitions: Record<string, KPIDefinition>
 }
 
-function formatVolume(value: number): string {
-  if (value >= 1000000) {
-    return `${(value / 1000000).toFixed(2)}M`
+function formatCurrency(value: number): string {
+  const absValue = Math.abs(value)
+  if (absValue >= 1000000) {
+    return `$${(absValue / 1000000).toFixed(2)}M`
   }
-  if (value >= 1000) {
-    return `${(value / 1000).toFixed(1)}K`
+  if (absValue >= 1000) {
+    return `$${(absValue / 1000).toFixed(1)}K`
   }
-  return value.toFixed(0)
+  return `$${absValue.toFixed(0)}`
 }
 
 function formatPercent(value: number): string {
@@ -36,28 +37,29 @@ export function InternalizationPanel({ metrics, definitions }: InternalizationPa
   return (
     <div className="internalization-panel">
       <div className="panel-section">
-        <h3 className="panel-section-title">Volume Summary</h3>
+        <h3 className="panel-section-title">Volume Summary (USD)</h3>
         <p className="panel-section-description">
           Breakdown of how client flow was handled - internalized vs externally hedged.
+          All volumes normalized to reporting currency (USD).
         </p>
         <div className="panel-metrics">
           <KPICard
             label="Client Volume"
-            value={formatVolume(metrics.total_client_volume)}
-            subtitle="Total traded"
+            value={formatCurrency(metrics.total_client_volume_usd || metrics.total_client_volume)}
+            subtitle="Total traded (USD)"
             trend="neutral"
             definition={definitions['total_client_volume']}
           />
           <KPICard
             label="Internalized"
-            value={formatVolume(metrics.total_internalized_volume)}
+            value={formatCurrency(metrics.total_internalized_volume_usd || metrics.total_internalized_volume)}
             subtitle={formatPercent(metrics.internalization_ratio)}
             trend="positive"
             definition={definitions['total_internalized_volume']}
           />
           <KPICard
             label="Externalized"
-            value={formatVolume(metrics.total_externalized_volume)}
+            value={formatCurrency(metrics.total_externalized_volume_usd || metrics.total_externalized_volume)}
             subtitle={formatPercent(1 - metrics.internalization_ratio)}
             trend="neutral"
             definition={definitions['total_externalized_volume']}
@@ -99,29 +101,34 @@ export function InternalizationPanel({ metrics, definitions }: InternalizationPa
         </div>
       </div>
 
-      {/* Per-pair breakdown */}
-      {metrics.pair_breakdown.length > 0 && (
+      {/* Per direct pair breakdown (USD normalized) */}
+      {metrics.direct_pair_breakdown && metrics.direct_pair_breakdown.length > 0 && (
         <div className="panel-section">
-          <h3 className="panel-section-title">By Currency Pair</h3>
+          <h3 className="panel-section-title">By Direct Currency Pair (USD)</h3>
+          <p className="panel-section-description">
+            Volume breakdown by direct pairs after decrossing. All values in reporting currency.
+          </p>
           <table className="metrics-table">
             <thead>
               <tr>
                 <th>Pair</th>
-                <th>Client Vol</th>
-                <th>Internalized</th>
-                <th>Externalized</th>
+                <th>Client Vol (USD)</th>
+                <th>Internalized (USD)</th>
+                <th>Externalized (USD)</th>
                 <th>Int. %</th>
               </tr>
             </thead>
             <tbody>
-              {metrics.pair_breakdown.map((pair, index) => (
+              {metrics.direct_pair_breakdown.map((pair, index) => (
                 <tr key={index}>
-                  <td className="pair-name">{String(pair.pair || pair['pair'])}</td>
-                  <td>{formatVolume(Number(pair.client_volume || 0))}</td>
-                  <td>{formatVolume(Number(pair.internalized_volume || 0))}</td>
-                  <td>{formatVolume(Number(pair.externalized_volume || 0))}</td>
+                  <td className="pair-name">{pair.pair}</td>
+                  <td>{formatCurrency(pair.client_volume_usd)}</td>
+                  <td className="positive">{formatCurrency(pair.internalized_volume_usd)}</td>
+                  <td>{formatCurrency(pair.externalized_volume_usd)}</td>
                   <td>
-                    {formatPercent(Number(pair.internalization_ratio || 0))}
+                    <span className={pair.internalization_ratio > 0.5 ? 'positive' : ''}>
+                      {formatPercent(pair.internalization_ratio)}
+                    </span>
                   </td>
                 </tr>
               ))}

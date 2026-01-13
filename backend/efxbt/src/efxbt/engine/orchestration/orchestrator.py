@@ -4,13 +4,18 @@ Manages parallel simulation across currency pairs with state chaining
 across dates within each pair.
 """
 
+import gc
 import logging
+import os
+import tempfile
 import threading
 import traceback
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -23,10 +28,67 @@ from ...core.data.run_registry import (
     RunNotFoundError,
     RunRegistry,
 )
+from ...util.time import now_ms
+from ..io.pnl_writer import StreamingPnLWriter, merge_pnl_files
 from ..shard.shard_engine import ShardEngine
 from ..shard.state import PnLAttributionRecord, ShardState
 
 logger = logging.getLogger(__name__)
+
+# Timeout for individual shard futures (5 minutes per pair)
+FUTURE_TIMEOUT_SECONDS = 300
+
+# Flag to track if Numba JIT warmup has been done
+_numba_warmed_up = False
+
+
+def _warmup_numba_jit() -> None:
+    """Pre-warm Numba JIT compiled functions before spawning workers.
+
+    This triggers JIT compilation in the main process, which:
+    1. Validates the Numba code compiles without errors
+    2. Populates Numba's on-disk cache for workers to use
+    3. Identifies compilation issues early rather than in workers
+
+    Called once before the first ProcessPoolExecutor is created.
+    """
+    global _numba_warmed_up
+    if _numba_warmed_up:
+        return
+
+    try:
+        import numpy as np
+        from ..shard.fifo_matcher import (
+            FIFO_SLICE_DTYPE,
+            fifo_match_and_pnl_attributed,
+            calculate_unrealized_pnl_by_slice,
+        )
+
+        logger.info("Warming up Numba JIT compiled functions...")
+
+        # Create minimal dummy data for warmup
+        empty_queue = np.array([], dtype=FIFO_SLICE_DTYPE)
+
+        # Warmup the main matching function
+        fifo_match_and_pnl_attributed(
+            empty_queue,
+            np.int8(1),  # side
+            np.float64(100.0),  # qty
+            np.float64(1.1),  # mid
+            np.int64(1704110400000),  # timestamp
+            "client",  # source_type
+            "warmup_trade",  # trade_id
+        )
+
+        # Warmup the unrealized PnL function
+        calculate_unrealized_pnl_by_slice(empty_queue, 1.1)
+
+        _numba_warmed_up = True
+        logger.info("Numba JIT warmup complete")
+
+    except Exception as e:
+        logger.warning(f"Numba JIT warmup failed (non-fatal): {e}")
+        _numba_warmed_up = True  # Don't retry on failure
 
 
 class PairResult:
@@ -60,6 +122,10 @@ def execute_pair_shards(
     This function runs in a separate process. Dates are processed
     in chronological order with state chaining.
 
+    Memory optimization: Uses StreamingPnLWriter to write records to
+    a temp file instead of accumulating in memory, reducing peak memory
+    usage from O(total_records) to O(buffer_size).
+
     Args:
         pair: Currency pair (e.g., "EURUSD")
         shards: List of {date, file_path} dicts, sorted by date
@@ -71,7 +137,6 @@ def execute_pair_shards(
     """
     from ...core.data.schemas import DecrossedTradeRecord
 
-    all_pnl_records = []
     prior_state: ShardState | None = None
     aggregated_metrics: dict[str, float] = {
         "execution_pnl_reporting": 0.0,
@@ -83,45 +148,54 @@ def execute_pair_shards(
     }
     shard_results = []
 
+    # Create temp file path for streaming PnL writes
+    temp_dir = Path(tempfile.gettempdir())
+    pnl_temp_file = temp_dir / f"_pnl_{pair}_{uuid4().hex}.parquet"
+
     try:
-        for shard_info in shards:
-            # Load trades
-            table = pq.read_table(shard_info["file_path"])
-            client_trades = [
-                DecrossedTradeRecord(**row) for row in table.to_pylist()
-            ]
+        # Use streaming writer to avoid accumulating all records in memory
+        with StreamingPnLWriter(pnl_temp_file, buffer_size=10000) as writer:
+            for shard_info in shards:
+                # Load trades (batch construct without per-row validation)
+                table = pq.read_table(shard_info["file_path"])
+                client_trades = DecrossedTradeRecord.batch_from_table(table)
 
-            # Create engine
-            engine = ShardEngine(
-                pair=pair,
-                date=shard_info["date"],
-                config=config,
-                data_root=Path(data_root),
-            )
+                # Create engine
+                engine = ShardEngine(
+                    pair=pair,
+                    date=shard_info["date"],
+                    config=config,
+                    data_root=Path(data_root),
+                )
 
-            # Run with state chaining
-            result = engine.run(client_trades, prior_state)
+                # Run with state chaining
+                result = engine.run(client_trades, prior_state)
 
-            # Collect PnL records
-            all_pnl_records.extend(result.pnl_records)
+                # Stream PnL records to disk instead of accumulating
+                writer.write_records(result.pnl_records)
 
-            # Aggregate metrics
-            for key in aggregated_metrics:
-                aggregated_metrics[key] += result.metrics.get(key, 0.0)
+                # Aggregate metrics
+                for key in aggregated_metrics:
+                    aggregated_metrics[key] += result.metrics.get(key, 0.0)
 
-            shard_results.append({
-                "pair": pair,
-                "date": shard_info["date"],
-                **result.metrics,
-            })
+                shard_results.append({
+                    "pair": pair,
+                    "date": shard_info["date"],
+                    **result.metrics,
+                })
 
-            # Chain state to next day
-            prior_state = result.final_state
+                # Chain state to next day
+                prior_state = result.final_state
+
+                # Explicit cleanup to release memory between shards
+                del client_trades
+                del result
+                gc.collect()
 
         return {
             "pair": pair,
             "shard_count": len(shards),
-            "pnl_records": [_serialize_pnl_record(r) for r in all_pnl_records],
+            "pnl_temp_file": str(pnl_temp_file),  # Return path, not records
             "metrics": aggregated_metrics,
             "shard_results": shard_results,
             "error": None,
@@ -129,10 +203,13 @@ def execute_pair_shards(
 
     except Exception as e:
         logger.exception(f"Error executing shards for {pair}")
+        # Cleanup temp file on error
+        if pnl_temp_file.exists():
+            pnl_temp_file.unlink(missing_ok=True)
         return {
             "pair": pair,
             "shard_count": len(shards),
-            "pnl_records": [],
+            "pnl_temp_file": None,
             "metrics": aggregated_metrics,
             "shard_results": shard_results,
             "error": str(e),
@@ -162,18 +239,20 @@ class RunOrchestrator:
         self,
         registry: RunRegistry,
         data_root: Path,
-        max_workers: int = 4,
+        max_workers: int | None = None,
     ) -> None:
         """Initialize orchestrator.
 
         Args:
             registry: Run registry for persistence
             data_root: Root directory for market/trade data
-            max_workers: Maximum parallel workers (one per pair)
+            max_workers: Maximum parallel workers (one per pair).
+                        If None, uses min(cpu_count, 16) for optimal parallelism.
         """
         self.registry = registry
         self.data_root = Path(data_root)
-        self.max_workers = max_workers
+        # Dynamic worker count based on CPU cores (capped at 16 to avoid memory issues)
+        self.max_workers = max_workers or min(os.cpu_count() or 4, 16)
 
         # Active runs tracking
         self._active_runs: dict[str, dict] = {}
@@ -195,9 +274,9 @@ class RunOrchestrator:
         """
         run = self.registry.get_run(run_id)
 
-        if run.status != RunStatus.CREATED:
+        if run.status not in (RunStatus.CREATED, RunStatus.RUNNING):
             raise InvalidRunStateError(
-                run_id, run.status, "Can only start runs in CREATED status"
+                run_id, run.status, "Can only start runs in CREATED or RUNNING status"
             )
 
         # Discover shards and group by pair
@@ -205,12 +284,12 @@ class RunOrchestrator:
 
         if not shards:
             # No shards to simulate - mark as completed immediately
-            now_ms = int(datetime.utcnow().timestamp() * 1000)
+            current_time_ms = now_ms()
             self.registry.update_status(
                 run_id,
                 RunStatus.COMPLETED,
-                started_at_ms=now_ms,
-                completed_at_ms=now_ms,
+                started_at_ms=current_time_ms,
+                completed_at_ms=current_time_ms,
             )
             self._write_empty_results(run_id)
             return
@@ -221,9 +300,10 @@ class RunOrchestrator:
         self.registry.update_status(
             run_id,
             RunStatus.RUNNING,
-            started_at_ms=int(datetime.utcnow().timestamp() * 1000),
+            started_at_ms=now_ms(),
         )
         self.registry.update_progress(run_id, total_shards=len(shards))
+        self.registry.update_stage(run_id, "simulating")
 
         # Create cancellation event
         cancel_event = threading.Event()
@@ -232,6 +312,9 @@ class RunOrchestrator:
         sim_config = run.config.simulation_config
         if sim_config is None:
             sim_config = SimulationConfig(dataset=run.config.dataset)
+
+        # Pre-warm Numba JIT functions before spawning workers
+        _warmup_numba_jit()
 
         # Submit pair workers to executor
         executor = ProcessPoolExecutor(max_workers=self.max_workers)
@@ -263,7 +346,7 @@ class RunOrchestrator:
         threading.Thread(
             target=self._monitor_completion,
             args=(run_id, futures, executor),
-            daemon=True,
+            daemon=False,  # Must complete before process exits to update status
         ).start()
 
     def cancel_run(self, run_id: str) -> bool:
@@ -370,13 +453,19 @@ class RunOrchestrator:
             futures: List of (pair, future) tuples
             executor: ProcessPoolExecutor to shutdown
         """
+        logger.info(f"[MONITOR] Starting _monitor_completion for run {run_id}")
+        print(f"[MONITOR] Starting _monitor_completion for run {run_id}", flush=True)
+
         all_results: list[dict] = []
         failed_pairs: list[dict] = []
         completed_shards = 0
 
+        logger.info(f"[MONITOR] Waiting for {len(futures)} futures to complete")
+        print(f"[MONITOR] Waiting for {len(futures)} futures to complete", flush=True)
+
         for pair, future in futures:
             try:
-                result = future.result()  # Blocks until complete
+                result = future.result(timeout=FUTURE_TIMEOUT_SECONDS)
                 all_results.append(result)
 
                 # Update progress
@@ -399,6 +488,24 @@ class RunOrchestrator:
                             error=result["error"],
                         )
 
+            except FuturesTimeoutError:
+                logger.error(f"Timeout waiting for {pair} after {FUTURE_TIMEOUT_SECONDS}s")
+                failed_pairs.append({
+                    "pair": pair,
+                    "error": f"Timeout after {FUTURE_TIMEOUT_SECONDS} seconds",
+                })
+
+            except BrokenProcessPool as e:
+                logger.error(
+                    f"Worker process crashed for {pair}. This usually indicates "
+                    "memory exhaustion or a segmentation fault in the worker. "
+                    f"Error: {e}"
+                )
+                failed_pairs.append({
+                    "pair": pair,
+                    "error": f"Worker process crashed: {e}",
+                })
+
             except Exception as e:
                 logger.exception(f"Error getting result for {pair}")
                 failed_pairs.append({
@@ -406,48 +513,99 @@ class RunOrchestrator:
                     "error": str(e),
                 })
 
-        executor.shutdown(wait=True)
+        logger.info(f"[MONITOR] All futures completed. Results: {len(all_results)}, Failed: {len(failed_pairs)}")
+        print(f"[MONITOR] All futures completed. Results: {len(all_results)}, Failed: {len(failed_pairs)}", flush=True)
+
+        # Shutdown executor with cancel_futures to terminate any pending work
+        # after failures or timeouts
+        try:
+            executor.shutdown(wait=True, cancel_futures=bool(failed_pairs))
+        except TypeError:
+            # Python < 3.9 doesn't support cancel_futures
+            executor.shutdown(wait=True)
+
+        logger.info(f"[MONITOR] Executor shutdown complete for run {run_id}")
+        print(f"[MONITOR] Executor shutdown complete for run {run_id}", flush=True)
 
         # Determine final status
         try:
             run = self.registry.get_run(run_id)
+            logger.info(f"[MONITOR] Current run status: {run.status}")
+            print(f"[MONITOR] Current run status: {run.status}", flush=True)
 
             # Check if cancelled
             if run.status == RunStatus.CANCELLED:
                 self._cleanup_active_run(run_id)
                 return
 
-            # Aggregate results and write
-            self._write_final_results(run_id, all_results)
+            # Aggregate results and write - track success separately
+            write_succeeded = False
+            write_error_message = None
+            try:
+                logger.info(f"[MONITOR] Writing final results for run {run_id}")
+                print(f"[MONITOR] Writing final results for run {run_id}", flush=True)
+                self._write_final_results(run_id, all_results)
+                write_succeeded = True
+                logger.info(f"[MONITOR] Successfully wrote final results for run {run_id}")
+                print(f"[MONITOR] Successfully wrote final results for run {run_id}", flush=True)
+            except Exception as write_error:
+                logger.exception(f"Failed to write results for run {run_id}")
+                write_error_message = str(write_error)
+
+            # Status update happens regardless of write success
+            completed_at_ms = now_ms()
+            logger.info(f"[MONITOR] About to update status. failed_pairs={len(failed_pairs)}, write_succeeded={write_succeeded}")
+            print(f"[MONITOR] About to update status. failed_pairs={len(failed_pairs)}, write_succeeded={write_succeeded}", flush=True)
 
             if failed_pairs:
+                logger.info(f"[MONITOR] Setting status to FAILED (pairs failed)")
+                print(f"[MONITOR] Setting status to FAILED (pairs failed)", flush=True)
                 self.registry.update_status(
                     run_id,
                     RunStatus.FAILED,
-                    completed_at_ms=int(datetime.utcnow().timestamp() * 1000),
+                    completed_at_ms=completed_at_ms,
                     error_message=f"{len(failed_pairs)} pair(s) failed",
                 )
+            elif not write_succeeded:
+                logger.info(f"[MONITOR] Setting status to FAILED (write failed)")
+                print(f"[MONITOR] Setting status to FAILED (write failed)", flush=True)
+                self.registry.update_status(
+                    run_id,
+                    RunStatus.FAILED,
+                    completed_at_ms=completed_at_ms,
+                    error_message=f"Results write failed: {write_error_message}",
+                )
             else:
+                logger.info(f"[MONITOR] Setting status to COMPLETED")
+                print(f"[MONITOR] Setting status to COMPLETED", flush=True)
                 self.registry.update_status(
                     run_id,
                     RunStatus.COMPLETED,
-                    completed_at_ms=int(datetime.utcnow().timestamp() * 1000),
+                    completed_at_ms=completed_at_ms,
                 )
+            logger.info(f"[MONITOR] Status update complete for run {run_id}")
+            print(f"[MONITOR] Status update complete for run {run_id}", flush=True)
 
         except Exception as e:
-            logger.exception(f"Error finalizing run {run_id}")
+            logger.exception(f"[MONITOR] Error finalizing run {run_id}: {e}")
+            print(f"[MONITOR] Error finalizing run {run_id}: {e}", flush=True)
             try:
                 self.registry.update_status(
                     run_id,
                     RunStatus.FAILED,
-                    completed_at_ms=int(datetime.utcnow().timestamp() * 1000),
+                    completed_at_ms=now_ms(),
                     error_message=f"Finalization error: {e}",
                 )
-            except Exception:
-                pass
+            except Exception as inner_e:
+                logger.exception(f"[MONITOR] Failed to update status after error: {inner_e}")
+                print(f"[MONITOR] Failed to update status after error: {inner_e}", flush=True)
 
         finally:
+            logger.info(f"[MONITOR] Cleaning up run {run_id}")
+            print(f"[MONITOR] Cleaning up run {run_id}", flush=True)
             self._cleanup_active_run(run_id)
+            logger.info(f"[MONITOR] _monitor_completion finished for run {run_id}")
+            print(f"[MONITOR] _monitor_completion finished for run {run_id}", flush=True)
 
     def _cleanup_active_run(self, run_id: str) -> None:
         """Remove run from active tracking.
@@ -462,34 +620,34 @@ class RunOrchestrator:
     def _write_final_results(self, run_id: str, all_results: list[dict]) -> None:
         """Aggregate and write final results.
 
+        Memory optimization: Merges per-pair temp files using DuckDB
+        instead of accumulating all records in memory.
+
         Args:
             run_id: Run identifier
             all_results: List of pair result dicts
         """
+        print(f"[WRITE] _write_final_results started for {run_id}", flush=True)
         run_dir = self.registry.get_run_dir(run_id)
 
-        # Aggregate PnL records
-        all_pnl_rows = []
-        for result in all_results:
-            for record in result.get("pnl_records", []):
-                for attr in record.get("trade_attributions", []):
-                    all_pnl_rows.append({
-                        "timestamp_ms": record["timestamp_ms"],
-                        **attr,
-                    })
+        # Collect temp file paths from pair results
+        temp_files = [
+            Path(r["pnl_temp_file"])
+            for r in all_results
+            if r.get("pnl_temp_file") and Path(r["pnl_temp_file"]).exists()
+        ]
+        print(f"[WRITE] Found {len(temp_files)} temp files to merge", flush=True)
 
-        # Write PnL attribution
-        if all_pnl_rows:
-            table = pa.Table.from_pylist(all_pnl_rows)
-            pq.write_table(
-                table,
-                run_dir / "pnl_attribution.parquet",
-                compression="snappy",
-            )
-        else:
-            # Write empty table
-            empty_table = pa.table({})
-            pq.write_table(empty_table, run_dir / "pnl_attribution.parquet")
+        # Merge temp files using memory-efficient DuckDB merge
+        final_pnl_path = run_dir / "pnl_attribution.parquet"
+        print(f"[WRITE] Merging PnL files...", flush=True)
+        merge_pnl_files(temp_files, final_pnl_path)
+        print(f"[WRITE] PnL files merged", flush=True)
+
+        # Cleanup temp files
+        for temp_file in temp_files:
+            if temp_file.exists():
+                temp_file.unlink(missing_ok=True)
 
         # Aggregate metrics for summary
         pairs = []
@@ -554,6 +712,8 @@ class RunOrchestrator:
         )
 
         # Phase 5: Calculate and attach risk metrics
+        print(f"[WRITE] Calculating risk metrics...", flush=True)
+        self.registry.update_stage(run_id, "computing_metrics")
         try:
             pnl_path = run_dir / "pnl_attribution.parquet"
             calculator = RiskMetricsCalculator()
@@ -562,11 +722,17 @@ class RunOrchestrator:
             run = self.registry.get_run(run_id)
             sim_config = run.config.simulation_config
 
+            # Get direct pairs from general config (default to EURUSD, GBPUSD)
+            direct_pairs = ["EURUSD", "GBPUSD"]
+            if run.config.general_config:
+                direct_pairs = run.config.general_config.direct_pairs
+
             risk, ops, internalization = calculator.calculate_all(
                 pnl_path=pnl_path,
                 config=sim_config,
                 client_volume=total_client_volume,
                 total_pnl=total_pnl,
+                direct_pairs=direct_pairs,
             )
             frontier = calculator.compute_frontier_scores(summary, risk)
 
@@ -575,12 +741,15 @@ class RunOrchestrator:
             summary.internalization_metrics = internalization
             summary.frontier_scores = frontier
 
-            logger.info(f"Computed risk metrics for run {run_id}")
+            print(f"[WRITE] Risk metrics computed", flush=True)
         except Exception as e:
-            logger.warning(f"Failed to compute risk metrics for run {run_id}: {e}")
+            print(f"[WRITE] Risk metrics failed (optional): {e}", flush=True)
             # Continue without risk metrics - they're optional
 
+        print(f"[WRITE] Writing summary to registry...", flush=True)
+        self.registry.update_stage(run_id, "writing_results")
         self.registry.write_summary(run_id, summary)
+        print(f"[WRITE] Summary written successfully", flush=True)
 
     def _write_empty_results(self, run_id: str) -> None:
         """Write empty results for runs with no shards.

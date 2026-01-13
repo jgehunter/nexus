@@ -31,16 +31,19 @@ export interface DecrossConfig {
   min_leg_qty: number
 }
 
+export interface GeneralConfig {
+  direct_pairs: string[]
+}
+
 export interface RunConfig {
   dataset: string
-  tradebook: string | null
-  pairs: string[]
+  tradebook: string
   start_date: string | null
   end_date: string | null
   name: string | null
   description: string | null
-  enable_decrossing: boolean
   decross_config?: DecrossConfig
+  general_config?: GeneralConfig
   simulation_config: SimulationConfig | null
   mode?: 'backtest' | 'replay'
 }
@@ -82,14 +85,24 @@ export interface RunCreateResponse {
   config_hash: string
 }
 
+export type DecrossStatus = 'pending' | 'running' | 'completed' | 'failed'
+
 export interface RunStatusResponse {
   run_id: string
   status: RunStatus
+  // Decrossing progress
+  decross_status: DecrossStatus
+  decross_progress_pct: number
+  decross_total_dates: number
+  decross_completed_dates: number
+  decross_current_date: string | null
+  // Shard progress
   total_shards: number
   completed_shards: number
   failed_shards: number
   progress_pct: number
   started_at_ms: number | null
+  current_stage: string | null
   error_message: string | null
 }
 

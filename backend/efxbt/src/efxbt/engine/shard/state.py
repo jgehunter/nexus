@@ -89,17 +89,31 @@ class ShardState(BaseModel):
         # Convert state to dict
         state_dict = self.model_dump()
 
-        # Flatten FIFO queue for Parquet (one row per slice)
+        # Flatten FIFO queue for Parquet (single-pass instead of 7 list comprehensions)
         if self.fifo_queue:
-            queue_records = [slice_.model_dump() for slice_ in self.fifo_queue]
+            slice_ids = []
+            timestamps = []
+            sides = []
+            qtys = []
+            open_mids = []
+            source_types = []
+            source_trade_ids = []
+            for slice_ in self.fifo_queue:
+                slice_ids.append(slice_.slice_id)
+                timestamps.append(slice_.open_timestamp_ms)
+                sides.append(slice_.side)
+                qtys.append(slice_.qty)
+                open_mids.append(slice_.open_mid)
+                source_types.append(slice_.source_type)
+                source_trade_ids.append(slice_.source_trade_id)
             queue_table = pa.table({
-                "slice_id": [r["slice_id"] for r in queue_records],
-                "open_timestamp_ms": [r["open_timestamp_ms"] for r in queue_records],
-                "side": [r["side"] for r in queue_records],
-                "qty": [r["qty"] for r in queue_records],
-                "open_mid": [r["open_mid"] for r in queue_records],
-                "source_type": [r["source_type"] for r in queue_records],
-                "source_trade_id": [r["source_trade_id"] for r in queue_records],
+                "slice_id": slice_ids,
+                "open_timestamp_ms": timestamps,
+                "side": sides,
+                "qty": qtys,
+                "open_mid": open_mids,
+                "source_type": source_types,
+                "source_trade_id": source_trade_ids,
             })
         else:
             # Empty queue - create empty table with schema
@@ -186,11 +200,21 @@ class TradePnLAttribution(BaseModel):
     PnL is tracked in both native currency (quote currency of the pair) and
     reporting currency for proper aggregation.
 
+    Side Convention:
+        The side field ALWAYS represents the HOUSE's action (our perspective):
+        +1 = house buys base currency (we are going long)
+        -1 = house sells base currency (we are going short)
+
+        This convention is consistent throughout the system for both client
+        trades and hedge trades.
+
     Attributes:
         timestamp_ms: Event timestamp
         event_type: Type of event ("client_fill", "hedge_fill", "hedge_match", "sample")
         source_trade_id: Links to DecrossedTradeRecord.source_trade_id
         pair: Currency pair
+        side: Trade side from HOUSE's perspective (+1 = house buys, -1 = house sells)
+        qty: Trade quantity in base currency
         native_currency: Native currency of PnL (quote currency of pair)
         reporting_currency: Reporting currency for aggregation (e.g., "USD")
         fx_rate: FX rate used for native -> reporting conversion
@@ -214,6 +238,11 @@ class TradePnLAttribution(BaseModel):
     # Source trade identification
     source_trade_id: str  # Links back to DecrossedTradeRecord.source_trade_id
     pair: str
+
+    # Trade details (for risk metrics)
+    side: int = 0  # House's side: +1 (house buys) or -1 (house sells)
+    qty: float = 0.0  # Quantity in base currency
+    price: float = 0.0  # Mid price at event time (for position valuation)
 
     # Currency tracking for PnL conversion
     native_currency: str  # Quote currency of the pair (e.g., "USD" for EURUSD)
@@ -283,6 +312,9 @@ PNL_ATTRIBUTION_ARROW_SCHEMA = pa.schema([
     ("event_type", pa.string()),
     ("source_trade_id", pa.string()),
     ("pair", pa.string()),
+    ("side", pa.int8()),
+    ("qty", pa.float64()),
+    ("price", pa.float64()),
     ("native_currency", pa.string()),
     ("reporting_currency", pa.string()),
     ("fx_rate", pa.float64()),

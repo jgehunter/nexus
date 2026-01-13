@@ -478,3 +478,170 @@
 .charts-row {
   margin-bottom: 1rem;
 }
+
+/* Position Timeseries Charts */
+.position-timeseries-charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+  gap: 1rem;
+}
+
+.position-chart-container {
+  background: var(--color-bg);
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.position-chart-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.position-chart-header .chart-title {
+  margin: 0;
+  font-family: monospace;
+  color: var(--color-accent);
+  font-size: 1rem;
+}
+
+.position-chart-stats {
+  display: flex;
+  gap: 1rem;
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+.position-chart-stats .stat strong {
+  color: var(--color-text);
+}
+
+/* Table positive/negative colors */
+.metrics-table td.positive {
+  color: var(--color-success);
+}
+
+.metrics-table td.negative {
+  color: var(--color-error);
+}
+
+/* Combined Position Chart */
+.combined-position-chart-container {
+  background: var(--color-bg);
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+/* Toggle Controls */
+.position-toggle-controls {
+  margin-bottom: 1rem;
+}
+
+.toggle-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.toggle-btn {
+  padding: 0.375rem 0.75rem;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.toggle-btn:hover {
+  border-color: var(--color-accent);
+  color: var(--color-text);
+}
+
+.toggle-btn.active {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: white;
+}
+
+.pair-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.pair-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.25rem 0.5rem;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.75rem;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.pair-toggle:hover {
+  border-color: var(--color-text-muted);
+}
+
+.pair-toggle.active {
+  border-color: var(--color-accent);
+  background: rgba(88, 166, 255, 0.1);
+}
+
+.pair-toggle input[type="checkbox"] {
+  display: none;
+}
+
+.pair-toggle-indicator {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 2px solid;
+  flex-shrink: 0;
+}
+
+.pair-toggle-label {
+  font-family: monospace;
+  color: var(--color-text);
+}
+
+.pair-toggle-max {
+  color: var(--color-text-muted);
+  font-size: 0.7rem;
+}
+
+.pair-toggle.active .pair-toggle-label {
+  color: var(--color-accent);
+}
+
+/* Combined Position Tooltip */
+.combined-position-tooltip {
+  min-width: 200px;
+}
+
+.combined-position-tooltip .chart-tooltip-value {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.125rem 0;
+}
+
+.chart-tooltip-pair-indicator {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.chart-tooltip-usd {
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+  margin-left: 0.25rem;
+}

@@ -279,13 +279,13 @@ class DecrossingEngine:
         path: CurrencyPath,
         market_ticks: dict[str, MarketTickRecord],
     ) -> list[dict]:
-        """Adjust leg prices proportionally to match original cross rate.
+        """Adjust only the last leg's price to match original cross rate.
 
-        The market-based leg prices may not exactly reconstruct the original
-        cross price. We need to adjust them proportionally.
+        All legs use mid-market prices, except the last leg which is adjusted
+        so that the effective cross rate exactly matches the original trade price.
 
         Args:
-            legs: List of leg dicts with market_price
+            legs: List of leg dicts with market_price (already set to mid)
             original_price: Original cross trade price
             path: Currency path
             market_ticks: Market ticks
@@ -295,39 +295,57 @@ class DecrossingEngine:
 
         Example:
             Original: EURGBP @ 0.8500
-            Market: EURUSD @ 1.1000, GBPUSD @ 1.2500
+            Market: EURUSD mid @ 1.1000, GBPUSD mid @ 1.2500
             Implied: 1.1000 / 1.2500 = 0.8800 (≠ 0.8500!)
 
-            Adjustment factor = 0.8500 / 0.8800 = 0.9659
-            Apply to each leg price proportionally
+            Only adjust last leg:
+            - Leg 0: EURUSD @ 1.1000 (mid, unchanged)
+            - Leg 1: GBPUSD @ adjusted_price such that 1.1000 / adjusted = 0.8500
+                     adjusted_price = 1.1000 / 0.8500 = 1.2941
+
+        This approach is cleaner than adjusting all prices because:
+        1. Most legs execute at prevailing mid-market rates
+        2. Only one leg bears the price adjustment for rate matching
+        3. Better reflects real-world hedging execution
         """
         if len(legs) == 0:
             return legs
 
-        # Calculate implied cross rate from market-based leg prices
-        # For EUR->USD->GBP: implied = EURUSD / GBPUSD
-        # This is path-dependent and needs careful handling
+        # All legs except the last use their market_price (mid) unchanged
+        for i in range(len(legs) - 1):
+            legs[i]["price"] = legs[i]["market_price"]
 
-        # Simplified approach: calculate effective cross rate from leg prices
-        # then adjust all prices by ratio
+        # Calculate the implied rate from all legs EXCEPT the last one using mid prices
+        # Then solve for what the last leg's price should be
+        last_leg_idx = len(legs) - 1
+        last_is_inverted = path.inversions[last_leg_idx]
 
-        # For now, calculate implied rate by walking through path
-        implied_rate = 1.0
-        for leg, is_inverted in zip(legs, path.inversions):
+        # Calculate partial rate from all legs except the last
+        partial_rate = 1.0
+        for i in range(len(legs) - 1):
+            leg = legs[i]
+            is_inverted = path.inversions[i]
             if is_inverted:
-                implied_rate /= leg["market_price"]
+                partial_rate /= leg["market_price"]
             else:
-                implied_rate *= leg["market_price"]
+                partial_rate *= leg["market_price"]
 
-        # Adjustment factor
-        if abs(implied_rate) < 1e-10:
-            raise ValueError("Implied rate is zero, cannot backsolve prices")
+        # Solve for the last leg's price
+        # If last leg is not inverted: original_price = partial_rate * last_price
+        #   => last_price = original_price / partial_rate
+        # If last leg is inverted: original_price = partial_rate / last_price
+        #   => last_price = partial_rate / original_price
+        if abs(partial_rate) < 1e-10:
+            raise ValueError("Partial rate is zero, cannot backsolve prices")
+        if abs(original_price) < 1e-10:
+            raise ValueError("Original price is zero, cannot backsolve prices")
 
-        adjustment_factor = original_price / implied_rate
+        if last_is_inverted:
+            last_price = partial_rate / original_price
+        else:
+            last_price = original_price / partial_rate
 
-        # Apply adjustment to all leg prices
-        for leg in legs:
-            leg["price"] = leg["market_price"] * adjustment_factor
+        legs[last_leg_idx]["price"] = last_price
 
         return legs
 

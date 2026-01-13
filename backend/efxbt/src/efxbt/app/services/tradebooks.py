@@ -7,6 +7,8 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from ...core.cache.health_cache import get_health_cache
+from ...core.cache.registry_cache import get_registry_cache
 from ...core.data.market_health import (
     TradeBookHealthAnalyzer,
     TradeBookHealthReport,
@@ -59,19 +61,37 @@ class TradeBooksService:
         """
         self.data_root = Path(data_root)
         self.registry = TradeBookRegistry(self.data_root)
+        self._registry_cache = get_registry_cache()
+        self._health_cache = get_health_cache()
 
     def list_tradebooks(self) -> list[TradeBookSummary]:
         """List all available trade books with summary info.
 
+        Uses caching to avoid repeated filesystem scans.
+
         Returns:
             List of trade book summaries
         """
-        book_names = self.registry.list_tradebooks()
-        summaries = []
+        # Try cache first for the list
+        cached_names = self._registry_cache.get_tradebook_list(
+            self.registry.tradebooks_dir
+        )
+        if cached_names is not None:
+            book_names = cached_names
+        else:
+            book_names = self.registry.list_tradebooks()
+            self._registry_cache.set_tradebook_list(
+                self.registry.tradebooks_dir, book_names
+            )
 
+        summaries = []
         for name in book_names:
             try:
-                inventory = self.registry.discover_tradebook(name)
+                # Try cache for individual inventory
+                inventory = self._registry_cache.get_tradebook_inventory(name)
+                if inventory is None:
+                    inventory = self.registry.discover_tradebook(name)
+                    self._registry_cache.set_tradebook_inventory(name, inventory)
                 summaries.append(self._inventory_to_summary(inventory))
             except Exception:
                 # Skip trade books that fail to load
@@ -114,6 +134,8 @@ class TradeBooksService:
     ) -> TradeBookHealthResponse:
         """Compute health report for a trade book.
 
+        Uses caching to avoid recomputing expensive health analysis.
+
         Args:
             book_name: Name of the trade book
             validate_schemas: Whether to validate parquet schemas
@@ -124,9 +146,29 @@ class TradeBooksService:
         Raises:
             FileNotFoundError: If trade book does not exist
         """
-        inventory = self.registry.discover_tradebook(book_name)
+        # Get inventory (with caching)
+        inventory = self._registry_cache.get_tradebook_inventory(book_name)
+        if inventory is None:
+            inventory = self.registry.discover_tradebook(book_name)
+            self._registry_cache.set_tradebook_inventory(book_name, inventory)
+
+        # Try health cache (only for non-schema-validation requests)
+        if not validate_schemas:
+            cached_report = self._health_cache.get_tradebook_health(
+                book_name, inventory.version_id
+            )
+            if cached_report is not None:
+                return self._health_report_to_response(cached_report)
+
+        # Compute health report
         analyzer = TradeBookHealthAnalyzer(inventory)
         report = analyzer.compute_health_report(validate_schemas=validate_schemas)
+
+        # Cache the result (only if not validating schemas)
+        if not validate_schemas:
+            self._health_cache.set_tradebook_health(
+                book_name, inventory.version_id, report
+            )
 
         return self._health_report_to_response(report)
 

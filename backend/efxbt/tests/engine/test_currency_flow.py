@@ -64,7 +64,7 @@ class TestCurrencyFlowTracker:
         assert pair == "EURUSD"
         assert side == 1  # BUY EUR (base of EURUSD)
         assert qty == 1000.0  # Original quantity
-        assert price == 1.1002  # Ask price (buying)
+        assert price == 1.10  # Mid price (all legs use mid, backsolving adjusts last leg)
 
     def test_two_hop_buy_trade_second_leg(
         self, simple_path_eur_usd_gbp, market_ticks_eur_usd_gbp
@@ -88,12 +88,14 @@ class TestCurrencyFlowTracker:
 
         assert pair == "GBPUSD"
         # After leg 0: have ~1100 USD (1000 EUR * 1.10)
-        # Need to BUY GBP (final currency), which is SELL USD (since inverted)
-        assert side == -1  # SELL base of GBPUSD to get GBP
-        # Quantity should be ~1100 USD
-        expected_usd_qty = 1000.0 * 1.10  # Mid price of EURUSD
-        assert abs(qty - expected_usd_qty) < 1.0
-        assert price == 1.2498  # Bid price (selling)
+        # For inverted pair GBPUSD (going USD->GBP direction):
+        # - We SELL GBP (base of GBPUSD) to provide USD (quote)
+        # - leg_qty must be in GBP (base currency of the pair)
+        assert side == -1  # SELL base of GBPUSD
+        # Quantity should be in GBP: 1100 USD / 1.25 = 880 GBP
+        expected_gbp_qty = 1000.0 * 1.10 / 1.25  # ~880 GBP
+        assert abs(qty - expected_gbp_qty) < 1.0
+        assert price == 1.25  # Mid price
 
     def test_two_hop_sell_trade(
         self, simple_path_eur_usd_gbp, market_ticks_eur_usd_gbp
@@ -118,7 +120,7 @@ class TestCurrencyFlowTracker:
         assert pair1 == "EURUSD"
         assert side1 == -1  # SELL EUR
         assert qty1 == 1000.0
-        assert price1 == 1.0998  # Bid price (selling)
+        assert price1 == 1.10  # Mid price (all legs use mid)
 
         # Second leg: Convert USD to GBP
         pair2, side2, qty2, price2 = tracker.calculate_leg_parameters(
@@ -126,11 +128,13 @@ class TestCurrencyFlowTracker:
         )
 
         assert pair2 == "GBPUSD"
-        # Original intent is SELL final (GBP), which means BUY GBP here
-        # With inverted pair (GBPUSD), we BUY base (GBP)
+        # Original intent is SELL EUR (get GBP), money flows forward: EUR->USD->GBP
+        # For inverted pair GBPUSD (going USD->GBP direction):
+        # - We BUY GBP (base of GBPUSD) with USD (quote)
+        # - leg_qty is in GBP (base of pair)
         assert side2 == 1  # BUY base
-        expected_usd_qty = 1000.0 * 1.10
-        assert abs(qty2 - expected_usd_qty) < 1.0
+        expected_gbp_qty = 1000.0 * 1.10 / 1.25  # ~880 GBP
+        assert abs(qty2 - expected_gbp_qty) < 1.0
 
     def test_intermediate_quantity_calculation(
         self, simple_path_eur_usd_gbp, market_ticks_eur_usd_gbp
@@ -325,7 +329,7 @@ class TestCurrencyFlowTracker:
         assert pair == "EURUSD"
         assert side == 1
         assert qty == 1000.0
-        assert price == 1.1002  # Ask
+        assert price == 1.10  # Mid price (all legs use mid)
 
 
 class TestCurrencyFlowEdgeCases:

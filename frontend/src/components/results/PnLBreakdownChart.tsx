@@ -113,9 +113,9 @@ export function PnLBreakdownChart({ data, groupBy, height = 300 }: PnLBreakdownC
             wrapperStyle={{ paddingTop: 10 }}
             formatter={(value) => <span style={{ color: '#c9d1d9' }}>{value}</span>}
           />
-          <Bar dataKey="execution_pnl" name="Execution" fill="#3fb950" stackId="a" />
-          <Bar dataKey="inventory_pnl" name="Inventory" fill="#58a6ff" stackId="a" />
-          <Bar dataKey="hedge_pnl" name="Hedge" fill="#f85149" stackId="a" />
+          <Bar dataKey="execution_pnl" name="Execution" fill="#3fb950" />
+          <Bar dataKey="inventory_pnl" name="Inventory" fill="#58a6ff" />
+          <Bar dataKey="hedge_pnl" name="Hedge" fill="#f85149" />
         </BarChart>
       </ResponsiveContainer>
     </div>

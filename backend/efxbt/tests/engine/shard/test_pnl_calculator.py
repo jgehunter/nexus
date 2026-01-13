@@ -82,17 +82,20 @@ class TestPnLCalculator:
         fx_converter = FXConverter("USD")
         calc = PnLCalculator(fx_converter)
 
-        # EURUSD: buy at 1.1005, mid was 1.1000
+        # EURUSD: House SELLS at 1.1005, mid was 1.1000
+        # (Client buys from us → house sells)
         pnl_native, pnl_reporting = calc.calculate_execution_pnl(
             exec_price=1.1005,
             exec_mid=1.1000,
             qty=1000.0,
-            side=1,
+            side=-1,  # House SELLS (client buys from us)
             pair="EURUSD",
             fx_rate=1.0,
         )
 
-        # Expected: (1.1005 - 1.1000) * 1000 * 1 = +0.5 USD
+        # Formula: (exec_price - exec_mid) * qty * (-side)
+        # = (1.1005 - 1.1000) * 1000 * (-(-1)) = 0.0005 * 1000 * 1 = +0.5 USD
+        # House sold above mid → profit
         assert abs(pnl_native - 0.5) < 1e-8
         assert abs(pnl_reporting - 0.5) < 1e-8  # Same currency
 
@@ -101,18 +104,21 @@ class TestPnLCalculator:
         fx_converter = FXConverter("USD")
         calc = PnLCalculator(fx_converter)
 
-        # EURGBP: sell at 0.8795, mid was 0.8800
+        # EURGBP: House BUYS at 0.8795, mid was 0.8800
+        # (Client sells to us → house buys)
         # GBPUSD rate = 1.25 for conversion
         pnl_native, pnl_reporting = calc.calculate_execution_pnl(
             exec_price=0.8795,
             exec_mid=0.8800,
             qty=1000.0,
-            side=-1,
+            side=1,  # House BUYS (client sells to us)
             pair="EURGBP",
             fx_rate=1.25,
         )
 
-        # Expected native (GBP): (0.8795 - 0.8800) * 1000 * -1 = +0.5 GBP
+        # Formula: (exec_price - exec_mid) * qty * (-side)
+        # = (0.8795 - 0.8800) * 1000 * (-(+1)) = -0.0005 * 1000 * (-1) = +0.5 GBP
+        # House bought below mid → profit
         assert abs(pnl_native - 0.5) < 1e-8
 
         # Expected reporting (USD): 0.5 GBP * 1.25 = 0.625 USD
@@ -123,18 +129,21 @@ class TestPnLCalculator:
         fx_converter = FXConverter("USD")
         calc = PnLCalculator(fx_converter)
 
-        # USDJPY: buy at 150.05, mid was 150.00
+        # USDJPY: House SELLS at 150.05, mid was 150.00
+        # (Client buys from us → house sells)
         # Need to invert for JPY->USD conversion: 1/150.00 = 0.00666667
         pnl_native, pnl_reporting = calc.calculate_execution_pnl(
             exec_price=150.05,
             exec_mid=150.00,
             qty=1000.0,
-            side=1,
+            side=-1,  # House SELLS (client buys from us)
             pair="USDJPY",
             fx_rate=150.00,  # USDJPY mid (need to invert)
         )
 
-        # Expected native (JPY): (150.05 - 150.00) * 1000 * 1 = +50.0 JPY
+        # Formula: (exec_price - exec_mid) * qty * (-side)
+        # = (150.05 - 150.00) * 1000 * (-(-1)) = 0.05 * 1000 * 1 = +50.0 JPY
+        # House sold above mid → profit
         assert abs(pnl_native - 50.0) < 1e-8
 
         # Expected reporting (USD): 50.0 JPY / 150.00 = 0.333... USD
@@ -267,37 +276,39 @@ class TestPnLCalculatorEdgeCases:
     """Test edge cases and error handling."""
 
     def test_negative_execution_pnl(self):
-        """Test negative execution PnL (unfavorable fill)."""
+        """Test negative execution PnL (unfavorable fill for house)."""
         fx_converter = FXConverter("USD")
         calc = PnLCalculator(fx_converter)
 
-        # Buy at 1.1020, mid was 1.1000 (paid above mid)
+        # House BUYS at 1.1020, mid was 1.1000 (house paid above mid - bad for house)
         pnl_native, pnl_reporting = calc.calculate_execution_pnl(
             exec_price=1.1020,
             exec_mid=1.1000,
             qty=1000.0,
-            side=1,
+            side=1,  # House BUYS
             pair="EURUSD",
             fx_rate=1.0,
         )
 
-        # Expected: (1.1020 - 1.1000) * 1000 * 1 = +2.0 (still positive!)
-        # This is correct - buyer paid 2 more than mid
-        assert abs(pnl_native - 2.0) < 1e-8
+        # Formula: (exec_price - exec_mid) * qty * (-side)
+        # = (1.1020 - 1.1000) * 1000 * (-(+1)) = 0.002 * 1000 * (-1) = -2.0
+        # House bought above mid → loss
+        assert abs(pnl_native - (-2.0)) < 1e-8
 
-        # Sell at 1.0980, mid was 1.1000 (received below mid)
+        # House SELLS at 1.0980, mid was 1.1000 (house received below mid - bad for house)
         pnl_native2, pnl_reporting2 = calc.calculate_execution_pnl(
             exec_price=1.0980,
             exec_mid=1.1000,
             qty=1000.0,
-            side=-1,
+            side=-1,  # House SELLS
             pair="EURUSD",
             fx_rate=1.0,
         )
 
-        # Expected: (1.0980 - 1.1000) * 1000 * -1 = +2.0 (still positive!)
-        # This is correct - seller received 2 less than mid
-        assert abs(pnl_native2 - 2.0) < 1e-8
+        # Formula: (exec_price - exec_mid) * qty * (-side)
+        # = (1.0980 - 1.1000) * 1000 * (-(-1)) = -0.002 * 1000 * 1 = -2.0
+        # House sold below mid → loss
+        assert abs(pnl_native2 - (-2.0)) < 1e-8
 
     def test_large_fx_rate(self):
         """Test with large FX rate (e.g., USDJPY)."""

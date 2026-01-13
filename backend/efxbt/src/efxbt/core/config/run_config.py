@@ -5,6 +5,13 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
+# Canonical direct pairs - pairs that typically have market data and can be hedged externally
+DEFAULT_DIRECT_PAIRS = [
+    "EURUSD", "EURCHF", "EURCZK", "EURDKK", "EURHUF", "EURNOK", "EURPLN", "EURRON", "EURSEK",
+    "USDJPY", "GBPUSD", "USDCAD", "AUDUSD", "NZDUSD", "USDAED", "USDCNH", "USDHKD",
+    "USDILS", "USDMXN", "USDQAR", "USDSAR", "USDSGD", "USDTHB", "USDTRY", "USDZAR", "USDCLP",
+]
+
 
 class RunStatus(str, Enum):
     """Run lifecycle states."""
@@ -33,9 +40,9 @@ class DecrossConfig(BaseModel):
     max_path_length: Annotated[
         int,
         Field(
-            default=3,
+            default=4,
             ge=2,
-            description="Maximum number of currencies in decomposition path",
+            description="Maximum number of currencies in decomposition path (4 allows 3-leg decomposition)",
         ),
     ]
     use_banker_rounding: Annotated[
@@ -119,6 +126,22 @@ class SimulationConfig(BaseModel):
     ]
 
 
+class GeneralConfig(BaseModel):
+    """General configuration that applies across all runs.
+
+    Contains settings like which pairs are considered "direct" pairs
+    (can be hedged externally) vs cross pairs (need decomposition).
+    """
+
+    direct_pairs: Annotated[
+        list[str],
+        Field(
+            default_factory=lambda: DEFAULT_DIRECT_PAIRS.copy(),
+            description="Currency pairs that can be hedged externally (direct pairs)",
+        ),
+    ]
+
+
 class RunConfig(BaseModel):
     """Configuration for a single backtest run.
 
@@ -126,15 +149,18 @@ class RunConfig(BaseModel):
     hedge policies, risk parameters, and PnL attribution.
     """
 
-    # Dataset selection
+    # Dataset selection (required - provides market data)
     dataset: str = Field(
         ...,
-        description="Name of the dataset to use",
+        description="Name of the market dataset to use",
         min_length=1,
     )
-    pairs: list[str] = Field(
-        default_factory=list,
-        description="Currency pairs to include (empty = all pairs in dataset)",
+
+    # Tradebook selection (required - provides trades to simulate)
+    tradebook: str = Field(
+        ...,
+        description="Name of the tradebook to simulate",
+        min_length=1,
     )
 
     # Date range
@@ -155,18 +181,16 @@ class RunConfig(BaseModel):
         description="Simulation mode",
     )
 
-    # Decrossing configuration
-    enable_decrossing: bool = Field(
-        default=True,
-        description="Enable automatic trade decrossing in pipeline",
-    )
+    # Decrossing configuration (always enabled when tradebook is specified)
     decross_config: DecrossConfig = Field(
         default_factory=DecrossConfig,
         description="Configuration for decrossing pipeline",
     )
-    tradebook: str | None = Field(
-        default=None,
-        description="Name of the tradebook to decross (if enable_decrossing=True)",
+
+    # General configuration
+    general_config: GeneralConfig = Field(
+        default_factory=GeneralConfig,
+        description="General configuration (direct pairs, etc.)",
     )
 
     # Simulation configuration (Phase 3)

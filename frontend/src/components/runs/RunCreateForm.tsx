@@ -5,9 +5,9 @@
 import { useState, useEffect } from 'react'
 import { listDatasets, getDataset, type DatasetSummary } from '../../api/datasets'
 import { listTradeBooks, type TradeBookSummary } from '../../api/tradebooks'
-import { createRun, type RunConfig, type SimulationConfig } from '../../api/runs'
+import { createRun, type RunConfig, type SimulationConfig, type GeneralConfig } from '../../api/runs'
 
-type Step = 'data' | 'simulation' | 'review'
+type Step = 'data' | 'config' | 'simulation' | 'review'
 
 interface RunCreateFormProps {
   onCreated: (runId: string) => void
@@ -51,9 +51,11 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
   const [selectedTradebook, setSelectedTradebook] = useState<string>('')
   const [availablePairs, setAvailablePairs] = useState<string[]>([])
   const [availableDates, setAvailableDates] = useState<string[]>([])
-  const [selectedPairs, setSelectedPairs] = useState<string[]>([])
   const [startDate, setStartDate] = useState<string>('')
   const [endDate, setEndDate] = useState<string>('')
+
+  // Form values - General Config (defaults to all pairs from selected dataset)
+  const [directPairs, setDirectPairs] = useState<string[]>([])
 
   // Form values - Simulation Settings
   const [hedgePolicy, setHedgePolicy] = useState('aggressive')
@@ -87,6 +89,10 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
         if (datasetsRes.length > 0) {
           setSelectedDataset(datasetsRes[0].name)
         }
+        // Auto-select first tradebook if available
+        if (tradebooksRes.length > 0) {
+          setSelectedTradebook(tradebooksRes[0].name)
+        }
       } catch (err) {
         console.error('Failed to load data:', err)
         setError('Failed to load datasets and tradebooks')
@@ -102,6 +108,7 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
     if (!selectedDataset) {
       setAvailablePairs([])
       setAvailableDates([])
+      setDirectPairs([])
       return
     }
 
@@ -112,8 +119,10 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
         setAvailablePairs(details.pairs)
         setAvailableDates(details.dates)
 
-        // Auto-select all pairs and full date range
-        setSelectedPairs(details.pairs)
+        // Default ALL dataset pairs as direct pairs (they have market data)
+        setDirectPairs(details.pairs)
+
+        // Auto-select full date range
         if (details.dates.length > 0) {
           setStartDate(details.dates[0])
           setEndDate(details.dates[details.dates.length - 1])
@@ -128,18 +137,10 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
     loadDatasetDetails()
   }, [selectedDataset])
 
-  const handlePairToggle = (pair: string) => {
-    setSelectedPairs((prev) =>
+  const handleDirectPairToggle = (pair: string) => {
+    setDirectPairs((prev) =>
       prev.includes(pair) ? prev.filter((p) => p !== pair) : [...prev, pair]
     )
-  }
-
-  const handleSelectAllPairs = () => {
-    setSelectedPairs(availablePairs)
-  }
-
-  const handleDeselectAllPairs = () => {
-    setSelectedPairs([])
   }
 
   const handleSubmit = async () => {
@@ -149,7 +150,7 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
     // Build pair_bands object with only non-default values
     const effectivePairBands: Record<string, number> = {}
     if (enablePairBands) {
-      for (const pair of selectedPairs) {
+      for (const pair of availablePairs) {
         const pairBand = pairBands[pair]
         if (pairBand !== undefined && pairBand !== riskBandQty) {
           effectivePairBands[pair] = pairBand
@@ -169,15 +170,18 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
       sample_interval_seconds: sampleInterval,
     }
 
+    const generalConfig: GeneralConfig = {
+      direct_pairs: directPairs,
+    }
+
     const config: RunConfig = {
       dataset: selectedDataset,
-      tradebook: selectedTradebook || null,
-      pairs: selectedPairs,
+      tradebook: selectedTradebook,
       start_date: startDate ? formatDateForApi(startDate) : null,
       end_date: endDate ? formatDateForApi(endDate) : null,
       name: runName || null,
       description: runDescription || null,
-      enable_decrossing: !!selectedTradebook,
+      general_config: generalConfig,
       simulation_config: simConfig,
     }
 
@@ -191,7 +195,8 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
     }
   }
 
-  const canProceedToSimulation = selectedDataset && selectedPairs.length > 0
+  const canProceedToConfig = selectedDataset && selectedTradebook
+  const canProceedToSimulation = true // General config has defaults
   const canProceedToReview = true // Simulation settings have defaults
   const canSubmit = !submitting
 
@@ -222,13 +227,18 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
           <span className="step-label">Data Selection</span>
         </div>
         <div className="step-divider" />
-        <div className={`step ${step === 'simulation' ? 'active' : step === 'review' ? 'completed' : ''}`}>
+        <div className={`step ${step === 'config' ? 'active' : step === 'simulation' || step === 'review' ? 'completed' : ''}`}>
           <span className="step-number">2</span>
+          <span className="step-label">General Config</span>
+        </div>
+        <div className="step-divider" />
+        <div className={`step ${step === 'simulation' ? 'active' : step === 'review' ? 'completed' : ''}`}>
+          <span className="step-number">3</span>
           <span className="step-label">Simulation Settings</span>
         </div>
         <div className="step-divider" />
         <div className={`step ${step === 'review' ? 'active' : ''}`}>
-          <span className="step-number">3</span>
+          <span className="step-number">4</span>
           <span className="step-label">Review & Create</span>
         </div>
       </div>
@@ -244,7 +254,7 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
       {step === 'data' && (
         <div className="form-step">
           <div className="form-section">
-            <h3>Dataset</h3>
+            <h3>Market Dataset</h3>
             <select
               className="form-select"
               value={selectedDataset}
@@ -257,16 +267,19 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
                 </option>
               ))}
             </select>
+            <p className="form-hint">
+              Market data provides price ticks for simulation.
+            </p>
           </div>
 
           <div className="form-section">
-            <h3>Tradebook (optional)</h3>
+            <h3>Trade Book</h3>
             <select
               className="form-select"
               value={selectedTradebook}
               onChange={(e) => setSelectedTradebook(e.target.value)}
             >
-              <option value="">No tradebook (simulation only)</option>
+              <option value="">Select a tradebook...</option>
               {tradebooks.map((tb) => (
                 <option key={tb.name} value={tb.name}>
                   {tb.name} ({tb.total_trades} trades)
@@ -274,55 +287,16 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
               ))}
             </select>
             <p className="form-hint">
-              Select a tradebook to run simulation with client trades. Leave empty for market data only.
+              Trade book contains the client trades to simulate. All currency pairs in the trades will be processed.
             </p>
           </div>
 
           {selectedDataset && (
-            <>
-              <div className="form-section">
-                <h3>Currency Pairs</h3>
-                {loadingDatasetDetails ? (
-                  <p>Loading pairs...</p>
-                ) : (
-                  <>
-                    <div className="pair-select-actions">
-                      <button
-                        type="button"
-                        className="btn btn-ghost btn-sm"
-                        onClick={handleSelectAllPairs}
-                      >
-                        Select All
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-ghost btn-sm"
-                        onClick={handleDeselectAllPairs}
-                      >
-                        Deselect All
-                      </button>
-                      <span className="pair-count">
-                        {selectedPairs.length} of {availablePairs.length} selected
-                      </span>
-                    </div>
-                    <div className="pair-grid">
-                      {availablePairs.map((pair) => (
-                        <label key={pair} className="pair-checkbox">
-                          <input
-                            type="checkbox"
-                            checked={selectedPairs.includes(pair)}
-                            onChange={() => handlePairToggle(pair)}
-                          />
-                          <span>{pair}</span>
-                        </label>
-                      ))}
-                    </div>
-                  </>
-                )}
-              </div>
-
-              <div className="form-section">
-                <h3>Date Range</h3>
+            <div className="form-section">
+              <h3>Date Range</h3>
+              {loadingDatasetDetails ? (
+                <p>Loading dates...</p>
+              ) : (
                 <div className="date-range-inputs">
                   <div className="form-field">
                     <label>Start Date</label>
@@ -353,13 +327,62 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
                     </select>
                   </div>
                 </div>
-              </div>
-            </>
+              )}
+            </div>
+          )}
+
+          {selectedDataset && !loadingDatasetDetails && (
+            <div className="form-section info-section">
+              <h4>Available Pairs in Dataset</h4>
+              <p className="pairs-preview">
+                {availablePairs.join(', ') || 'No pairs found'}
+              </p>
+            </div>
           )}
 
           <div className="form-actions">
             <button className="btn btn-secondary" onClick={onCancel}>
               Cancel
+            </button>
+            <button
+              className="btn btn-primary"
+              disabled={!canProceedToConfig}
+              onClick={() => setStep('config')}
+            >
+              Next: General Config
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Step 2: General Config */}
+      {step === 'config' && (
+        <div className="form-step">
+          <div className="form-section">
+            <h3>Direct Pairs</h3>
+            <p className="form-hint">
+              Direct pairs can be hedged externally in the market. Cross pairs will be decomposed into direct pair legs.
+            </p>
+            <div className="pair-grid">
+              {availablePairs.map((pair) => (
+                <label key={pair} className="pair-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={directPairs.includes(pair)}
+                    onChange={() => handleDirectPairToggle(pair)}
+                  />
+                  <span>{pair}</span>
+                </label>
+              ))}
+            </div>
+            <p className="form-hint">
+              Selected as direct: {directPairs.length > 0 ? directPairs.join(', ') : 'None'}
+            </p>
+          </div>
+
+          <div className="form-actions">
+            <button className="btn btn-secondary" onClick={() => setStep('data')}>
+              Back
             </button>
             <button
               className="btn btn-primary"
@@ -372,7 +395,7 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
         </div>
       )}
 
-      {/* Step 2: Simulation Settings */}
+      {/* Step 3: Simulation Settings */}
       {step === 'simulation' && (
         <div className="form-step">
           <div className="form-section">
@@ -470,7 +493,7 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
                   if (e.target.checked && Object.keys(pairBands).length === 0) {
                     // Initialize all pairs with global default
                     const initialBands: Record<string, number> = {}
-                    for (const pair of selectedPairs) {
+                    for (const pair of availablePairs) {
                       initialBands[pair] = riskBandQty
                     }
                     setPairBands(initialBands)
@@ -485,7 +508,7 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
                   <span>Pair</span>
                   <span>Band Qty (base currency)</span>
                 </div>
-                {selectedPairs.map((pair) => (
+                {availablePairs.map((pair) => (
                   <div key={pair} className="pair-bands-row">
                     <span className="pair-name">{pair}</span>
                     <input
@@ -511,7 +534,7 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
           </div>
 
           <div className="form-actions">
-            <button className="btn btn-secondary" onClick={() => setStep('data')}>
+            <button className="btn btn-secondary" onClick={() => setStep('config')}>
               Back
             </button>
             <button
@@ -525,7 +548,7 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
         </div>
       )}
 
-      {/* Step 3: Review & Create */}
+      {/* Step 4: Review & Create */}
       {step === 'review' && (
         <div className="form-step">
           <div className="form-section">
@@ -559,19 +582,17 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
                 <span className="summary-label">Dataset:</span>
                 <span className="summary-value">{selectedDataset}</span>
               </div>
-              {selectedTradebook && (
-                <div className="summary-row">
-                  <span className="summary-label">Tradebook:</span>
-                  <span className="summary-value">{selectedTradebook}</span>
-                </div>
-              )}
               <div className="summary-row">
-                <span className="summary-label">Pairs:</span>
-                <span className="summary-value">{selectedPairs.join(', ')}</span>
+                <span className="summary-label">Tradebook:</span>
+                <span className="summary-value">{selectedTradebook}</span>
               </div>
               <div className="summary-row">
                 <span className="summary-label">Date Range:</span>
                 <span className="summary-value">{startDate} to {endDate}</span>
+              </div>
+              <div className="summary-row">
+                <span className="summary-label">Direct Pairs:</span>
+                <span className="summary-value">{directPairs.join(', ') || 'None'}</span>
               </div>
               <div className="summary-row">
                 <span className="summary-label">Hedge Policy:</span>

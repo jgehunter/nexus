@@ -24,6 +24,13 @@ class TradeRecord(BaseModel):
 
     Trades can be either client trades (incoming flow) or hedge trades
     (executed by the desk to manage risk).
+
+    Side Convention (HOUSE's perspective throughout the system):
+        +1 = House BUYS base currency (going long)
+        -1 = House SELLS base currency (going short)
+
+        For client flow: When a client buys from us, WE are selling (side=-1).
+        For hedges: When we hedge by buying in the market, side=+1.
     """
 
     timestamp_ms: Annotated[
@@ -36,7 +43,7 @@ class TradeRecord(BaseModel):
     ]
     side: Annotated[
         Literal[1, -1],
-        Field(description="+1 = buy base currency, -1 = sell base currency"),
+        Field(description="+1 = house buys base, -1 = house sells base"),
     ]
     qty: Annotated[
         float,
@@ -154,6 +161,61 @@ class DecrossedTradeRecord(BaseModel):
                 raise ValueError(f"Invalid currency code in path: {curr}")
             result.append(curr)
         return result
+
+    @classmethod
+    def batch_from_table(cls, table: pa.Table) -> list["DecrossedTradeRecord"]:
+        """Efficiently batch-construct from Arrow table without per-row validation.
+
+        This method skips Pydantic validation since data from parquet was already
+        validated when written. Uses model_construct() for ~10x faster loading.
+
+        Args:
+            table: PyArrow table with DECROSSED_TRADE_ARROW_SCHEMA
+
+        Returns:
+            List of DecrossedTradeRecord instances
+        """
+        # Direct column access - much faster than to_pylist()
+        n = len(table)
+        if n == 0:
+            return []
+
+        # Extract columns (avoid repeated dict lookups)
+        timestamp_ms = table["timestamp_ms"].to_pylist()
+        pair = table["pair"].to_pylist()
+        side = table["side"].to_pylist()
+        qty = table["qty"].to_pylist()
+        price = table["price"].to_pylist()
+        trade_id = table["trade_id"].to_pylist()
+        order_id = table["order_id"].to_pylist()
+        source_trade_id = table["source_trade_id"].to_pylist()
+        source_pair = table["source_pair"].to_pylist()
+        source_price = table["source_price"].to_pylist()
+        leg_index = table["leg_index"].to_pylist()
+        leg_count = table["leg_count"].to_pylist()
+        path = table["path"].to_pylist()
+        is_direct = table["is_direct"].to_pylist()
+
+        # Batch construct using model_construct (skips validation)
+        return [
+            cls.model_construct(
+                timestamp_ms=timestamp_ms[i],
+                pair=pair[i],
+                side=side[i],
+                qty=qty[i],
+                price=price[i],
+                trade_id=trade_id[i],
+                order_id=order_id[i],
+                source_trade_id=source_trade_id[i],
+                source_pair=source_pair[i],
+                source_price=source_price[i],
+                leg_index=leg_index[i],
+                leg_count=leg_count[i],
+                path=path[i],
+                is_direct=is_direct[i],
+            )
+            for i in range(n)
+        ]
 
 
 class MarketTickRecord(BaseModel):

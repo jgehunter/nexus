@@ -105,6 +105,9 @@ class MarketDataHealthAnalyzer:
     for market tick data.
     """
 
+    # Batch size for DuckDB queries (to avoid overly large UNION ALL)
+    BATCH_SIZE = 50
+
     def __init__(self, inventory: MarketDatasetInventory):
         """Initialize analyzer.
 
@@ -118,18 +121,16 @@ class MarketDataHealthAnalyzer:
     ) -> MarketDataHealthReport:
         """Compute comprehensive health report for market data.
 
+        Uses batched DuckDB queries for efficient processing of many files.
+
         Args:
             validate_schemas: Whether to validate parquet schemas
 
         Returns:
             Market data health report with coverage and validation results
         """
-        tick_coverage = []
-
-        for pd in self.inventory.pair_dates:
-            if pd.file_path:
-                tick_stats = self._compute_tick_coverage(pd)
-                tick_coverage.append(tick_stats)
+        # Use batched queries for tick coverage (major performance improvement)
+        tick_coverage = self._compute_all_tick_coverage_batched()
 
         schema_validations = []
         if validate_schemas:
@@ -149,10 +150,147 @@ class MarketDataHealthAnalyzer:
             summary=summary,
         )
 
-    def _compute_tick_coverage(self, pd: MarketPairDateInventory) -> TickCoverageStats:
-        """Compute tick coverage statistics for a pair-date.
+    def _compute_all_tick_coverage_batched(self) -> list[TickCoverageStats]:
+        """Compute tick coverage for all files using batched DuckDB queries.
 
-        Uses DuckDB for efficient aggregation without loading all data.
+        Uses a single DuckDB connection and batches files to avoid
+        memory issues with large UNION ALL queries.
+
+        Returns:
+            List of tick coverage statistics for all pair-dates
+        """
+        # Filter to only files that exist
+        valid_pair_dates = [pd for pd in self.inventory.pair_dates if pd.file_path]
+
+        if not valid_pair_dates:
+            return []
+
+        results = []
+
+        # Process in batches to avoid memory issues
+        for i in range(0, len(valid_pair_dates), self.BATCH_SIZE):
+            batch = valid_pair_dates[i : i + self.BATCH_SIZE]
+            batch_results = self._compute_batch_tick_coverage(batch)
+            results.extend(batch_results)
+
+        return results
+
+    def _compute_batch_tick_coverage(
+        self, batch: list[MarketPairDateInventory]
+    ) -> list[TickCoverageStats]:
+        """Compute tick coverage for a batch of files in a single query.
+
+        Args:
+            batch: List of pair-date items to process
+
+        Returns:
+            List of tick coverage statistics
+        """
+        if not batch:
+            return []
+
+        try:
+            conn = duckdb.connect(":memory:")
+
+            # Build UNION ALL query for all files in batch
+            file_queries = []
+            for pd in batch:
+                # Escape single quotes in file path
+                file_path = str(pd.file_path).replace("'", "''")
+                file_queries.append(f"""
+                    SELECT
+                        '{pd.pair}' AS pair,
+                        '{pd.date}' AS date,
+                        timestamp_ms
+                    FROM read_parquet('{file_path}')
+                """)
+
+            # Combine all files and compute stats
+            combined_query = f"""
+            WITH all_ticks AS (
+                {' UNION ALL '.join(file_queries)}
+            ),
+            tick_data AS (
+                SELECT
+                    pair,
+                    date,
+                    timestamp_ms,
+                    LAG(timestamp_ms) OVER (PARTITION BY pair, date ORDER BY timestamp_ms) AS prev_ts
+                FROM all_ticks
+            ),
+            gaps AS (
+                SELECT
+                    pair,
+                    date,
+                    timestamp_ms - prev_ts AS gap_ms
+                FROM tick_data
+                WHERE prev_ts IS NOT NULL
+            ),
+            gap_stats AS (
+                SELECT
+                    pair,
+                    date,
+                    AVG(gap_ms) AS avg_gap,
+                    MAX(gap_ms) AS max_gap,
+                    SUM(CASE WHEN gap_ms > 60000 THEN 1 ELSE 0 END) AS gaps_1min,
+                    SUM(CASE WHEN gap_ms > 300000 THEN 1 ELSE 0 END) AS gaps_5min,
+                    SUM(CASE WHEN gap_ms > 900000 THEN 1 ELSE 0 END) AS gaps_15min
+                FROM gaps
+                GROUP BY pair, date
+            )
+            SELECT
+                t.pair,
+                t.date,
+                COUNT(*) AS tick_count,
+                MIN(t.timestamp_ms) AS first_ts,
+                MAX(t.timestamp_ms) AS last_ts,
+                g.avg_gap,
+                g.max_gap,
+                COALESCE(g.gaps_1min, 0) AS gaps_1min,
+                COALESCE(g.gaps_5min, 0) AS gaps_5min,
+                COALESCE(g.gaps_15min, 0) AS gaps_15min
+            FROM tick_data t
+            LEFT JOIN gap_stats g ON t.pair = g.pair AND t.date = g.date
+            GROUP BY t.pair, t.date, g.avg_gap, g.max_gap, g.gaps_1min, g.gaps_5min, g.gaps_15min
+            ORDER BY t.pair, t.date
+            """
+
+            rows = conn.execute(combined_query).fetchall()
+            conn.close()
+
+            # Convert results to TickCoverageStats
+            results = []
+            for row in rows:
+                pair, date, tick_count, first_ts, last_ts, avg_gap, max_gap, gaps_1min, gaps_5min, gaps_15min = row
+                duration_ms = (last_ts - first_ts) if (first_ts and last_ts) else None
+
+                results.append(
+                    TickCoverageStats(
+                        pair=pair,
+                        date=date,
+                        has_data=True,
+                        tick_count=tick_count or 0,
+                        first_timestamp_ms=first_ts,
+                        last_timestamp_ms=last_ts,
+                        duration_ms=duration_ms,
+                        avg_gap_ms=avg_gap,
+                        max_gap_ms=max_gap,
+                        gaps_over_1min=gaps_1min or 0,
+                        gaps_over_5min=gaps_5min or 0,
+                        gaps_over_15min=gaps_15min or 0,
+                    )
+                )
+
+            return results
+
+        except Exception:
+            # Fall back to individual queries on batch failure
+            return [self._compute_tick_coverage_single(pd) for pd in batch]
+
+    def _compute_tick_coverage_single(
+        self, pd: MarketPairDateInventory
+    ) -> TickCoverageStats:
+        """Compute tick coverage for a single file (fallback method).
 
         Args:
             pd: Market pair-date inventory item
@@ -165,18 +303,17 @@ class MarketDataHealthAnalyzer:
 
         try:
             conn = duckdb.connect(":memory:")
+            file_path = str(pd.file_path).replace("'", "''")
 
-            # Read tick data with timestamp analysis
             query = f"""
             WITH tick_data AS (
                 SELECT
                     timestamp_ms,
                     LAG(timestamp_ms) OVER (ORDER BY timestamp_ms) AS prev_ts
-                FROM read_parquet('{pd.file_path}')
+                FROM read_parquet('{file_path}')
             ),
             gaps AS (
-                SELECT
-                    timestamp_ms - prev_ts AS gap_ms
+                SELECT timestamp_ms - prev_ts AS gap_ms
                 FROM tick_data
                 WHERE prev_ts IS NOT NULL
             )
@@ -199,38 +336,27 @@ class MarketDataHealthAnalyzer:
             if result is None:
                 return TickCoverageStats(pair=pd.pair, date=pd.date, has_data=False)
 
-            tick_count = result[0] or 0
-            first_ts = result[1]
-            last_ts = result[2]
-            avg_gap = result[3]
-            max_gap = result[4]
-            gaps_1min = result[5] or 0
-            gaps_5min = result[6] or 0
-            gaps_15min = result[7] or 0
-
+            tick_count, first_ts, last_ts, avg_gap, max_gap, gaps_1min, gaps_5min, gaps_15min = result
             duration_ms = (last_ts - first_ts) if (first_ts and last_ts) else None
 
             return TickCoverageStats(
                 pair=pd.pair,
                 date=pd.date,
                 has_data=True,
-                tick_count=tick_count,
+                tick_count=tick_count or 0,
                 first_timestamp_ms=first_ts,
                 last_timestamp_ms=last_ts,
                 duration_ms=duration_ms,
                 avg_gap_ms=avg_gap,
                 max_gap_ms=max_gap,
-                gaps_over_1min=gaps_1min,
-                gaps_over_5min=gaps_5min,
-                gaps_over_15min=gaps_15min,
+                gaps_over_1min=gaps_1min or 0,
+                gaps_over_5min=gaps_5min or 0,
+                gaps_over_15min=gaps_15min or 0,
             )
 
         except Exception:
             return TickCoverageStats(
-                pair=pd.pair,
-                date=pd.date,
-                has_data=False,
-                tick_count=0,
+                pair=pd.pair, date=pd.date, has_data=False, tick_count=0
             )
 
     def _validate_schemas(self) -> list[SchemaValidation]:
@@ -326,7 +452,7 @@ class MarketDataHealthAnalyzer:
         schema_issues = len([v for v in schema_validations if not v.is_valid])
 
         return {
-            "total_market_files": len(tick_coverage),
+            "total_tick_files": len(tick_coverage),
             "total_ticks": total_ticks,
             "gaps_over_1min": total_gaps_1min,
             "gaps_over_5min": total_gaps_5min,
@@ -343,6 +469,9 @@ class TradeBookHealthAnalyzer:
     for trade data.
     """
 
+    # Batch size for DuckDB queries
+    BATCH_SIZE = 50
+
     def __init__(self, inventory: TradeBookInventory):
         """Initialize analyzer.
 
@@ -356,18 +485,16 @@ class TradeBookHealthAnalyzer:
     ) -> TradeBookHealthReport:
         """Compute comprehensive health report for trade book.
 
+        Uses batched DuckDB queries for efficient processing of many files.
+
         Args:
             validate_schemas: Whether to validate parquet schemas
 
         Returns:
             Trade book health report with statistics and validation results
         """
-        trade_stats = []
-
-        for df in self.inventory.date_files:
-            if df.file_path:
-                stats = self._compute_trade_stats(df)
-                trade_stats.append(stats)
+        # Use batched queries for trade stats (major performance improvement)
+        trade_stats = self._compute_all_trade_stats_batched()
 
         schema_validations = []
         if validate_schemas:
@@ -387,8 +514,101 @@ class TradeBookHealthAnalyzer:
             summary=summary,
         )
 
-    def _compute_trade_stats(self, df: TradeDateInventory) -> TradeStats:
-        """Compute trade statistics for a date.
+    def _compute_all_trade_stats_batched(self) -> list[TradeStats]:
+        """Compute trade stats for all files using batched DuckDB queries.
+
+        Uses a single DuckDB connection and batches files to avoid
+        memory issues with large UNION ALL queries.
+
+        Returns:
+            List of trade statistics for all dates
+        """
+        # Filter to only files that exist
+        valid_date_files = [df for df in self.inventory.date_files if df.file_path]
+
+        if not valid_date_files:
+            return []
+
+        results = []
+
+        # Process in batches to avoid memory issues
+        for i in range(0, len(valid_date_files), self.BATCH_SIZE):
+            batch = valid_date_files[i : i + self.BATCH_SIZE]
+            batch_results = self._compute_batch_trade_stats(batch)
+            results.extend(batch_results)
+
+        return results
+
+    def _compute_batch_trade_stats(
+        self, batch: list[TradeDateInventory]
+    ) -> list[TradeStats]:
+        """Compute trade stats for a batch of files in a single query.
+
+        Args:
+            batch: List of date inventory items to process
+
+        Returns:
+            List of trade statistics
+        """
+        if not batch:
+            return []
+
+        try:
+            conn = duckdb.connect(":memory:")
+
+            # Build UNION ALL query for all files in batch
+            file_queries = []
+            for df in batch:
+                # Escape single quotes in file path
+                file_path = str(df.file_path).replace("'", "''")
+                file_queries.append(f"""
+                    SELECT '{df.date}' AS date, timestamp_ms
+                    FROM read_parquet('{file_path}')
+                """)
+
+            # Combine all files and compute stats
+            combined_query = f"""
+            WITH all_trades AS (
+                {' UNION ALL '.join(file_queries)}
+            )
+            SELECT
+                date,
+                COUNT(*) AS trade_count,
+                MIN(timestamp_ms) AS first_ts,
+                MAX(timestamp_ms) AS last_ts
+            FROM all_trades
+            GROUP BY date
+            ORDER BY date
+            """
+
+            rows = conn.execute(combined_query).fetchall()
+            conn.close()
+
+            # Convert results to TradeStats
+            results = []
+            for row in rows:
+                date, trade_count, first_ts, last_ts = row
+                duration_ms = (last_ts - first_ts) if (first_ts and last_ts) else None
+
+                results.append(
+                    TradeStats(
+                        date=date,
+                        has_data=True,
+                        trade_count=trade_count or 0,
+                        first_timestamp_ms=first_ts,
+                        last_timestamp_ms=last_ts,
+                        duration_ms=duration_ms,
+                    )
+                )
+
+            return results
+
+        except Exception:
+            # Fall back to individual queries on batch failure
+            return [self._compute_trade_stats_single(df) for df in batch]
+
+    def _compute_trade_stats_single(self, df: TradeDateInventory) -> TradeStats:
+        """Compute trade statistics for a single file (fallback method).
 
         Args:
             df: Trade date inventory item
@@ -401,13 +621,14 @@ class TradeBookHealthAnalyzer:
 
         try:
             conn = duckdb.connect(":memory:")
+            file_path = str(df.file_path).replace("'", "''")
 
             query = f"""
             SELECT
                 COUNT(*) AS trade_count,
                 MIN(timestamp_ms) AS first_ts,
                 MAX(timestamp_ms) AS last_ts
-            FROM read_parquet('{df.file_path}')
+            FROM read_parquet('{file_path}')
             """
 
             result = conn.execute(query).fetchone()
@@ -416,16 +637,13 @@ class TradeBookHealthAnalyzer:
             if result is None:
                 return TradeStats(date=df.date, has_data=False)
 
-            trade_count = result[0] or 0
-            first_ts = result[1]
-            last_ts = result[2]
-
+            trade_count, first_ts, last_ts = result
             duration_ms = (last_ts - first_ts) if (first_ts and last_ts) else None
 
             return TradeStats(
                 date=df.date,
                 has_data=True,
-                trade_count=trade_count,
+                trade_count=trade_count or 0,
                 first_timestamp_ms=first_ts,
                 last_timestamp_ms=last_ts,
                 duration_ms=duration_ms,

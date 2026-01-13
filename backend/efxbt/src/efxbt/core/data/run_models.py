@@ -12,21 +12,66 @@ from ..config.run_config import RunConfig, RunStatus
 # -----------------------------------------------------------------------------
 
 
+class PositionTimeseriesPoint(BaseModel):
+    """Single point in position timeseries for a direct pair."""
+
+    timestamp_ms: int = Field(..., description="Timestamp in milliseconds")
+    position: float = Field(..., description="Net position in base currency")
+    position_usd: float = Field(
+        default=0.0, description="Net position value in reporting currency (USD)"
+    )
+
+
+class PairPositionTimeseries(BaseModel):
+    """Position timeseries for a single direct pair."""
+
+    pair: str = Field(..., description="Currency pair (e.g., EURUSD)")
+    points: list[PositionTimeseriesPoint] = Field(
+        default_factory=list, description="Timeseries points"
+    )
+    max_position: float = Field(
+        default=0.0, description="Maximum absolute position"
+    )
+    max_position_usd: float = Field(
+        default=0.0, description="Maximum position in reporting currency"
+    )
+
+
+class AggregatePositionTimeseriesPoint(BaseModel):
+    """Single point in aggregate position timeseries."""
+
+    timestamp_ms: int = Field(..., description="Timestamp in milliseconds")
+    total_abs_position_usd: float = Field(
+        ..., description="Sum of absolute USD positions across all pairs"
+    )
+
+
+class AggregatePositionTimeseries(BaseModel):
+    """Aggregate position timeseries across all direct pairs."""
+
+    points: list[AggregatePositionTimeseriesPoint] = Field(
+        default_factory=list, description="Timeseries points"
+    )
+    max_total_abs_position_usd: float = Field(
+        default=0.0, description="Maximum total absolute position in USD"
+    )
+
+
 class RiskMetrics(BaseModel):
     """Risk metrics for a completed run.
 
     All metrics are computed from the simulation's inventory and PnL timeseries.
     """
 
-    # Inventory Risk
+    # Inventory Risk (aggregate USD exposure across all direct pairs)
     max_abs_inventory: float = Field(
-        ..., description="Peak absolute position across all timestamps (base currency)"
+        ..., description="Peak aggregate absolute position in USD (sum of |position * rate| across pairs)"
     )
     inventory_p95: float = Field(
-        ..., description="95th percentile of absolute position (base currency)"
+        ..., description="95th percentile of aggregate absolute position in USD"
     )
     inventory_p99: float = Field(
-        ..., description="99th percentile of absolute position (base currency)"
+        ..., description="99th percentile of aggregate absolute position in USD"
     )
 
     # Drawdown
@@ -45,11 +90,6 @@ class RiskMetrics(BaseModel):
         ..., description="Start timestamp of worst interval (ms since epoch)"
     )
 
-    # Time-Based Risk
-    time_above_risk_band_pct: float = Field(
-        ..., description="Percentage of time position exceeded risk band threshold"
-    )
-
     # Efficient Frontier Score
     cvar_95: float = Field(
         ..., description="Conditional VaR at 95% - average of worst 5% of intervals"
@@ -58,6 +98,18 @@ class RiskMetrics(BaseModel):
     # Per-pair breakdown (optional)
     pair_risk: list[dict[str, Any]] = Field(
         default_factory=list, description="Risk metrics broken down by pair"
+    )
+
+    # Position timeseries by direct pair (EURUSD, GBPUSD, etc.)
+    position_timeseries: list[PairPositionTimeseries] = Field(
+        default_factory=list,
+        description="Position timeseries for each direct currency pair"
+    )
+
+    # Aggregate position timeseries (sum of absolute USD across all pairs)
+    aggregate_position_timeseries: AggregatePositionTimeseries | None = Field(
+        default=None,
+        description="Aggregate absolute USD position across all direct pairs"
     )
 
 
@@ -77,10 +129,31 @@ class OpsMetrics(BaseModel):
     avg_hedge_size: float = Field(
         ..., description="Average hedge trade size (base currency)"
     )
+    total_client_volume: float = Field(
+        default=0.0, description="Total client volume for hedges per unit calculation"
+    )
 
     # Per-pair breakdown (optional)
     pair_ops: list[dict[str, Any]] = Field(
         default_factory=list, description="Ops metrics broken down by pair"
+    )
+
+
+class DirectPairInternalization(BaseModel):
+    """Internalization metrics for a single direct pair (in reporting currency)."""
+
+    pair: str = Field(..., description="Direct currency pair (e.g., EURUSD)")
+    client_volume_usd: float = Field(
+        ..., description="Client volume normalized to reporting currency"
+    )
+    internalized_volume_usd: float = Field(
+        ..., description="Internalized volume in reporting currency"
+    )
+    externalized_volume_usd: float = Field(
+        ..., description="Externalized (hedged) volume in reporting currency"
+    )
+    internalization_ratio: float = Field(
+        ..., description="Internalization ratio for this pair (0.0 to 1.0)"
     )
 
 
@@ -89,24 +162,45 @@ class InternalizationMetrics(BaseModel):
 
     Internalization = volume matched between opposing client trades.
     Externalization = volume covered by hedging to the market.
+
+    All volumes are normalized to reporting currency (USD) for consistent aggregation.
+    Breakdown is by direct pairs only (decrossed trades).
     """
 
-    total_client_volume: float = Field(
-        ..., description="Total client trade volume (base currency)"
+    # Aggregates in reporting currency (USD)
+    total_client_volume_usd: float = Field(
+        ..., description="Total client trade volume (reporting currency)"
     )
-    total_internalized_volume: float = Field(
-        ..., description="Volume internalized between clients (base currency)"
+    total_internalized_volume_usd: float = Field(
+        ..., description="Volume internalized between clients (reporting currency)"
     )
-    total_externalized_volume: float = Field(
-        ..., description="Volume hedged externally (base currency)"
+    total_externalized_volume_usd: float = Field(
+        ..., description="Volume hedged externally (reporting currency)"
     )
     internalization_ratio: float = Field(
         ..., description="Internalized / total client volume (0.0 to 1.0)"
     )
 
-    # Per-pair breakdown
+    # Legacy fields (base currency - for backwards compatibility)
+    total_client_volume: float = Field(
+        default=0.0, description="Total client trade volume (base currency, legacy)"
+    )
+    total_internalized_volume: float = Field(
+        default=0.0, description="Volume internalized (base currency, legacy)"
+    )
+    total_externalized_volume: float = Field(
+        default=0.0, description="Volume hedged (base currency, legacy)"
+    )
+
+    # Per direct pair breakdown (in reporting currency)
+    direct_pair_breakdown: list[DirectPairInternalization] = Field(
+        default_factory=list,
+        description="Internalization by direct currency pair (reporting currency)"
+    )
+
+    # Legacy field for backwards compatibility
     pair_breakdown: list[dict[str, Any]] = Field(
-        default_factory=list, description="Internalization by currency pair"
+        default_factory=list, description="Legacy: Internalization by pair (base currency)"
     )
 
 
@@ -127,7 +221,7 @@ class EfficientFrontierScores(BaseModel):
         ..., description="Maximum drawdown as percentage of peak"
     )
     inventory_risk_score: float = Field(
-        ..., description="Composite risk score from P99 inventory and time above band"
+        ..., description="Normalized risk score from P99 inventory"
     )
 
     # Composite Score
@@ -159,6 +253,28 @@ class FailedShardDetail(BaseModel):
     traceback: str | None = None
 
 
+class DecrossProgress(BaseModel):
+    """Progress tracking for decrossing phase."""
+
+    status: Annotated[
+        str,
+        Field(description="Decrossing status: pending, running, completed, failed"),
+    ] = "pending"
+    total_dates: int = Field(0, description="Total number of dates to process")
+    completed_dates: int = Field(0, description="Number of dates completed")
+    current_date: str | None = Field(None, description="Currently processing date")
+    started_at_ms: int | None = Field(None, description="Decrossing start timestamp")
+    completed_at_ms: int | None = Field(None, description="Decrossing completion timestamp")
+    error: str | None = Field(None, description="Error message if failed")
+
+    @property
+    def progress_pct(self) -> float:
+        """Calculate decrossing progress percentage."""
+        if self.total_dates == 0:
+            return 0.0
+        return (self.completed_dates / self.total_dates) * 100
+
+
 class RunRecord(BaseModel):
     """Persistent run metadata stored in JSON."""
 
@@ -174,10 +290,22 @@ class RunRecord(BaseModel):
     started_at_ms: int | None = None
     completed_at_ms: int | None = None
 
-    # Progress tracking
+    # Decrossing progress (Phase: before shard execution)
+    decross_progress: DecrossProgress = Field(
+        default_factory=DecrossProgress,
+        description="Progress tracking for decrossing phase"
+    )
+
+    # Shard progress tracking
     total_shards: int = 0
     completed_shards: int = 0
     failed_shards: int = 0
+
+    # Current stage of the run (for UI progress display)
+    current_stage: str | None = Field(
+        None,
+        description="Current stage: decrossing, simulating, computing_metrics, writing_results"
+    )
 
     # Error info
     error_message: str | None = None
@@ -188,7 +316,7 @@ class RunRecord(BaseModel):
 
     @property
     def progress_pct(self) -> float:
-        """Calculate progress percentage."""
+        """Calculate shard progress percentage."""
         if self.total_shards == 0:
             return 0.0
         return (self.completed_shards + self.failed_shards) / self.total_shards * 100
@@ -208,11 +336,21 @@ class RunStatusResponse(BaseModel):
 
     run_id: str
     status: RunStatus
+
+    # Decrossing progress
+    decross_status: str = Field("pending", description="Decrossing status")
+    decross_progress_pct: float = Field(0.0, description="Decrossing progress percentage")
+    decross_total_dates: int = Field(0, description="Total dates to decross")
+    decross_completed_dates: int = Field(0, description="Dates completed decrossing")
+    decross_current_date: str | None = Field(None, description="Currently decrossing date")
+
+    # Shard progress
     total_shards: int
     completed_shards: int
     failed_shards: int
     progress_pct: float
     started_at_ms: int | None = None
+    current_stage: str | None = Field(None, description="Current stage of the run")
     error_message: str | None = None
 
 

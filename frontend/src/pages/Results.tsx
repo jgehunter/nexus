@@ -4,7 +4,6 @@
 
 import { useState, useEffect } from 'react'
 import {
-  listRuns,
   getRunSummary,
   getTimeseries,
   getPnLBreakdown,
@@ -13,8 +12,11 @@ import {
   type TimeseriesPoint,
   type PnLBreakdownEntry,
   type KPIDefinition,
-  type RunListItem,
 } from '../api/results'
+import {
+  listRuns,
+  type RunListItem,
+} from '../api/runs'
 import {
   ScoreCard,
   PnLChart,
@@ -191,7 +193,7 @@ export function Results() {
           >
             {runs.map((run) => (
               <option key={run.run_id} value={run.run_id}>
-                {run.run_id.slice(0, 8)}... ({new Date(run.created_at_ms).toLocaleDateString()})
+                {run.config?.name || run.run_id.slice(0, 8)} ({new Date(run.created_at_ms).toLocaleDateString()})
               </option>
             ))}
           </select>
