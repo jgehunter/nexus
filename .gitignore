@@ -131,6 +131,7 @@ tmp/
 temp/
 *.tmp
 *.temp
+tmpclaude-*
 
 # Jupyter
 .ipynb_checkpoints/
