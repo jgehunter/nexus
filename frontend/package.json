@@ -10,7 +10,14 @@
     "preview": "vite preview",
     "test": "vitest",
     "test:run": "vitest run",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "e2e": "playwright test --config=e2e/playwright.config.ts",
+    "e2e:headed": "playwright test --config=e2e/playwright.config.ts --headed",
+    "e2e:ui": "playwright test --config=e2e/playwright.config.ts --ui",
+    "e2e:debug": "playwright test --config=e2e/playwright.config.ts --debug",
+    "e2e:codegen": "playwright codegen http://localhost:5173",
+    "e2e:report": "playwright show-report",
+    "e2e:ci": "playwright test --config=e2e/playwright.config.ts --reporter=github,html"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -19,6 +26,7 @@
     "recharts": "^3.6.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.48.0",
     "@eslint/js": "^9.17.0",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.1",
