@@ -41,6 +41,16 @@ export function Navbar({ connectionStatus }: NavbarProps) {
             Results
           </NavLink>
         </li>
+        <li>
+          <NavLink to="/sweeps" className={({ isActive }) => isActive ? 'active' : ''}>
+            Sweeps
+          </NavLink>
+        </li>
+        <li>
+          <NavLink to="/compare" className={({ isActive }) => isActive ? 'active' : ''}>
+            Compare
+          </NavLink>
+        </li>
       </ul>
     </nav>
   )

@@ -6,6 +6,8 @@ import { Datasets } from './pages/Datasets'
 import { TradeBooks } from './pages/TradeBooks'
 import { Runs } from './pages/Runs'
 import { Results } from './pages/Results'
+import { Sweeps } from './pages/Sweeps'
+import { Compare } from './pages/Compare'
 
 function App() {
   const healthState = useHealthMonitor()
@@ -18,6 +20,8 @@ function App() {
         <Route path="/tradebooks" element={<TradeBooks />} />
         <Route path="/runs" element={<Runs />} />
         <Route path="/results" element={<Results />} />
+        <Route path="/sweeps" element={<Sweeps />} />
+        <Route path="/compare" element={<Compare />} />
       </Routes>
     </Layout>
   )

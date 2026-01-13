@@ -11,6 +11,7 @@ from ...engine.orchestration.orchestrator import RunOrchestrator
 from ..services.datasets import DatasetsService
 from ..services.decross import DecrossService
 from ..services.runs import RunService
+from ..services.sweeps import SweepService
 from ..services.tradebooks import TradeBooksService
 
 
@@ -102,4 +103,21 @@ def get_runs_service(settings: SettingsDep) -> RunService:
         data_root=settings.data_path,
         results_root=settings.results_path,
         orchestrator=_orchestrator,
+    )
+
+
+def get_sweeps_service(settings: SettingsDep) -> SweepService:
+    """Get sweeps service instance.
+
+    Args:
+        settings: Application settings
+
+    Returns:
+        Sweeps service initialized with data root, results path, and run service
+    """
+    run_service = get_runs_service(settings)
+    return SweepService(
+        data_root=settings.data_path,
+        results_root=settings.results_path,
+        run_service=run_service,
     )

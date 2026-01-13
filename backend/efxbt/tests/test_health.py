@@ -108,7 +108,11 @@ class TestStubEndpoints:
         assert "runs" in data
         assert isinstance(data["runs"], list)
 
-    def test_sweeps_returns_501(self, client: TestClient) -> None:
-        """Sweeps endpoint returns 501 Not Implemented."""
+    def test_sweeps_is_implemented(self, client: TestClient) -> None:
+        """Sweeps endpoint is now implemented and returns 200."""
         response = client.get("/api/v1/sweeps")
-        assert response.status_code == 501
+        # Should return 200 with empty list (no sweeps in test)
+        assert response.status_code == 200
+        data = response.json()
+        assert "sweeps" in data
+        assert isinstance(data["sweeps"], list)

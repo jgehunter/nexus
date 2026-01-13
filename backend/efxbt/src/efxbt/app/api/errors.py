@@ -83,6 +83,26 @@ class RunExecutionError(HTTPException):
         )
 
 
+class SweepNotFoundError(HTTPException):
+    """Exception when a sweep is not found."""
+
+    def __init__(self, sweep_id: str) -> None:
+        super().__init__(
+            status_code=404,
+            detail=f"Sweep '{sweep_id}' not found",
+        )
+
+
+class InvalidSweepStateError(HTTPException):
+    """Exception when an operation is invalid for current sweep state."""
+
+    def __init__(self, sweep_id: str, current_status: str, message: str) -> None:
+        super().__init__(
+            status_code=409,
+            detail=f"Sweep '{sweep_id}' ({current_status}): {message}",
+        )
+
+
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     """Custom handler for HTTP exceptions."""
     return JSONResponse(
