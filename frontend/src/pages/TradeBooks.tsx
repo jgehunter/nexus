@@ -34,22 +34,31 @@ export function TradeBooks() {
         }
 
         async function fetchHealth(tradeBooks: TradeBookSummary[]) {
-            setHealthLoading(true)
-            const reports = new Map<string, TradeBookHealthReport>()
+            if (tradeBooks.length === 0) return
 
-            for (const tradeBook of tradeBooks) {
+            setHealthLoading(true)
+
+            // Fetch health reports in parallel instead of sequentially
+            const healthPromises = tradeBooks.map(async (tradeBook) => {
                 try {
                     const health = await getTradeBookHealth(tradeBook.name)
-                    if (mounted) {
-                        reports.set(tradeBook.name, health)
-                        setHealthReports(new Map(reports))
-                    }
+                    return { name: tradeBook.name, health, error: null }
                 } catch (err) {
                     console.error(`Failed to load health for ${tradeBook.name}:`, err)
+                    return { name: tradeBook.name, health: null, error: err }
                 }
-            }
+            })
+
+            const results = await Promise.all(healthPromises)
 
             if (mounted) {
+                const reports = new Map<string, TradeBookHealthReport>()
+                for (const result of results) {
+                    if (result.health) {
+                        reports.set(result.name, result.health)
+                    }
+                }
+                setHealthReports(reports)
                 setHealthLoading(false)
             }
         }

@@ -1,0 +1,334 @@
+/**
+ * RunProgress component - real-time progress view for running runs.
+ */
+
+import { useState, useEffect, useRef } from 'react'
+import {
+  getRunStatus,
+  startRun,
+  cancelRun,
+  type RunStatusResponse,
+} from '../../api/runs'
+
+interface RunProgressProps {
+  runId: string
+  autoStart?: boolean
+  onBack: () => void
+  onComplete: (runId: string) => void
+}
+
+export function RunProgress({ runId, autoStart = false, onBack, onComplete }: RunProgressProps) {
+  const [status, setStatus] = useState<RunStatusResponse | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [elapsedMs, setElapsedMs] = useState(0)
+  const startedRef = useRef(false)
+  const startTimeRef = useRef<number | null>(null)
+
+  // Start run if autoStart is true
+  useEffect(() => {
+    if (!autoStart || startedRef.current) return
+    startedRef.current = true
+
+    async function start() {
+      try {
+        const response = await startRun(runId)
+        setStatus(response)
+        startTimeRef.current = response.started_at_ms || Date.now()
+        setLoading(false)
+      } catch (err) {
+        console.error('Failed to start run:', err)
+        setError('Failed to start run')
+        setLoading(false)
+      }
+    }
+
+    start()
+  }, [runId, autoStart])
+
+  // Fetch initial status when viewing existing run (not auto-starting)
+  useEffect(() => {
+    if (autoStart) return  // autoStart effect handles this case
+
+    async function fetchInitialStatus() {
+      try {
+        const response = await getRunStatus(runId)
+        setStatus(response)
+        if (response.started_at_ms) {
+          startTimeRef.current = response.started_at_ms
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to fetch run status')
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    fetchInitialStatus()
+  }, [runId, autoStart])
+
+  // Poll for status updates
+  useEffect(() => {
+    if (loading) return
+    if (
+      status?.status === 'completed' ||
+      status?.status === 'failed' ||
+      status?.status === 'cancelled'
+    ) {
+      return
+    }
+
+    const poll = async () => {
+      try {
+        const response = await getRunStatus(runId)
+        setStatus(response)
+
+        if (response.started_at_ms && !startTimeRef.current) {
+          startTimeRef.current = response.started_at_ms
+        }
+      } catch (err) {
+        console.error('Failed to get run status:', err)
+      }
+    }
+
+    const interval = setInterval(poll, 2000)
+    return () => clearInterval(interval)
+  }, [runId, loading, status?.status])
+
+  // Update elapsed time
+  useEffect(() => {
+    if (!startTimeRef.current) return
+    if (
+      status?.status === 'completed' ||
+      status?.status === 'failed' ||
+      status?.status === 'cancelled'
+    ) {
+      return
+    }
+
+    const interval = setInterval(() => {
+      setElapsedMs(Date.now() - (startTimeRef.current || Date.now()))
+    }, 1000)
+
+    return () => clearInterval(interval)
+  }, [status?.status])
+
+  const handleCancel = async () => {
+    if (!confirm('Are you sure you want to cancel this run?')) return
+    try {
+      await cancelRun(runId)
+      const response = await getRunStatus(runId)
+      setStatus(response)
+    } catch (err) {
+      console.error('Failed to cancel run:', err)
+      setError('Failed to cancel run')
+    }
+  }
+
+  const formatElapsed = (ms: number): string => {
+    const seconds = Math.floor(ms / 1000)
+    const minutes = Math.floor(seconds / 60)
+    const hours = Math.floor(minutes / 60)
+
+    if (hours > 0) {
+      return `${hours}h ${minutes % 60}m ${seconds % 60}s`
+    }
+    if (minutes > 0) {
+      return `${minutes}m ${seconds % 60}s`
+    }
+    return `${seconds}s`
+  }
+
+  if (loading) {
+    return (
+      <div className="run-progress-view">
+        <div className="loading-state">
+          <div className="spinner" />
+          <p>Starting run...</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="run-progress-view">
+        <div className="error-state">
+          <p>{error}</p>
+          <button className="btn btn-secondary" onClick={onBack}>
+            Back to List
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  if (!status) {
+    return (
+      <div className="run-progress-view">
+        <div className="error-state">
+          <p>Failed to load run status</p>
+          <button className="btn btn-secondary" onClick={onBack}>
+            Back to List
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  const isComplete =
+    status.status === 'completed' ||
+    status.status === 'failed' ||
+    status.status === 'cancelled'
+
+  return (
+    <div className="run-progress-view">
+      <div className="progress-header">
+        <button className="btn btn-ghost back-btn" onClick={onBack}>
+          &larr; Back
+        </button>
+        <h2>Run {runId.slice(0, 8)}...</h2>
+      </div>
+
+      <div className="progress-content">
+        <div className="progress-status">
+          <span className={`status-badge status-${status.status}`}>
+            {status.status}
+          </span>
+          {!isComplete && (
+            <span className="elapsed-time">Elapsed: {formatElapsed(elapsedMs)}</span>
+          )}
+        </div>
+
+        {/* Decrossing phase progress */}
+        {status.status === 'running' && status.decross_status === 'running' && (
+          <div className="progress-phase">
+            <h4>Phase 1: Decrossing Trades</h4>
+            <div className="progress-bar-container">
+              <div className="progress-bar-large">
+                <div
+                  className="progress-fill decross-fill"
+                  style={{ width: `${status.decross_progress_pct}%` }}
+                />
+              </div>
+              <div className="progress-stats">
+                <span className="progress-pct">{status.decross_progress_pct.toFixed(1)}%</span>
+                <span className="progress-shards">
+                  {status.decross_completed_dates} / {status.decross_total_dates} dates
+                </span>
+                {status.decross_current_date && (
+                  <span className="progress-current">
+                    Processing: {status.decross_current_date}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Shard simulation phase progress */}
+        {status.status === 'running' && (status.decross_status === 'completed' || status.total_shards > 0) && (
+          <div className="progress-phase">
+            {status.decross_status === 'completed' && <h4>Phase 2: Running Simulation</h4>}
+            <div className="progress-bar-container">
+              <div className="progress-bar-large">
+                <div
+                  className="progress-fill"
+                  style={{ width: `${status.progress_pct}%` }}
+                />
+              </div>
+              <div className="progress-stats">
+                <span className="progress-pct">{status.progress_pct.toFixed(1)}%</span>
+                <span className="progress-shards">
+                  {status.completed_shards} / {status.total_shards} shards
+                </span>
+                {status.failed_shards > 0 && (
+                  <span className="progress-failed">
+                    ({status.failed_shards} failed)
+                  </span>
+                )}
+              </div>
+            </div>
+            {/* Show current stage when shards are complete but run is still processing */}
+            {status.progress_pct >= 100 && status.current_stage && (
+              <div className="stage-indicator">
+                {status.current_stage === 'computing_metrics' && 'Computing risk metrics...'}
+                {status.current_stage === 'writing_results' && 'Writing results...'}
+                {status.current_stage === 'simulating' && 'Finalizing simulation...'}
+              </div>
+            )}
+          </div>
+        )}
+
+        {status.status === 'completed' && (
+          <div className="completion-message success">
+            <svg
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+            >
+              <polyline points="20 6 9 17 4 12" />
+            </svg>
+            <p>Run completed successfully!</p>
+          </div>
+        )}
+
+        {status.status === 'failed' && (
+          <div className="completion-message error">
+            <svg
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+            >
+              <circle cx="12" cy="12" r="10" />
+              <line x1="15" y1="9" x2="9" y2="15" />
+              <line x1="9" y1="9" x2="15" y2="15" />
+            </svg>
+            <p>Run failed: {status.error_message || 'Unknown error'}</p>
+          </div>
+        )}
+
+        {status.status === 'cancelled' && (
+          <div className="completion-message warning">
+            <svg
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+            >
+              <circle cx="12" cy="12" r="10" />
+              <line x1="8" y1="12" x2="16" y2="12" />
+            </svg>
+            <p>Run was cancelled</p>
+          </div>
+        )}
+      </div>
+
+      <div className="progress-actions">
+        {status.status === 'running' && (
+          <button className="btn btn-danger" onClick={handleCancel}>
+            Cancel Run
+          </button>
+        )}
+        {status.status === 'completed' && (
+          <button className="btn btn-primary" onClick={() => onComplete(runId)}>
+            View Results
+          </button>
+        )}
+        {(status.status === 'failed' || status.status === 'cancelled') && (
+          <button className="btn btn-secondary" onClick={onBack}>
+            Back to List
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}

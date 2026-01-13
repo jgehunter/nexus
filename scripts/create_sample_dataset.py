@@ -62,6 +62,10 @@ def create_trades_book(
 ) -> None:
     """Create trade files for a specific book and pair.
 
+    Side Convention (HOUSE's perspective):
+        side = +1: House BUYS base currency (client sells to us)
+        side = -1: House SELLS base currency (client buys from us)
+
     Args:
         dataset_dir: Dataset root directory
         book: Book name (e.g., MAD_GLD)
@@ -84,6 +88,7 @@ def create_trades_book(
                 base_ts + 18000000,  # 5 hours
             ],
             "pair": [pair] * 5,
+            # Side from HOUSE's perspective: +1 = house buys, -1 = house sells
             "side": [1, -1, 1, -1, 1],
             "qty": [100000.0, 150000.0, 200000.0, 175000.0, 125000.0],
             "price": [1.1000 + i * 0.0001 for i in range(5)],

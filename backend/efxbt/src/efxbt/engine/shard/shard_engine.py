@@ -18,6 +18,11 @@ from .hedge_policy import create_hedge_policy
 from .market_fetcher import MarketSnapshotFetcher
 from .pnl_calculator import PnLCalculator, calculate_hedge_cost
 from .state import FIFOSlice, PnLAttributionRecord, ShardState, TradePnLAttribution
+from .state_internal import (
+    TradePnLAttributionInternal,
+    PnLAttributionRecordInternal,
+    convert_records_to_pydantic,
+)
 from .timeline import build_timeline
 
 
@@ -32,13 +37,17 @@ class ShardResult(BaseModel):
         final_state: Final shard state (for chaining to next day)
         pnl_records: List of PnL attribution records (one per event)
         metrics: Summary metrics dict
+        fifo_queue_numpy: Raw numpy FIFO queue for efficient chaining (avoids Pydantic conversion)
     """
+
+    model_config = {"arbitrary_types_allowed": True}
 
     pair: str
     date: str
     final_state: ShardState
     pnl_records: list[PnLAttributionRecord]
     metrics: dict
+    fifo_queue_numpy: np.ndarray | None = None  # For efficient state chaining
 
 
 class ShardEngine:
@@ -87,12 +96,14 @@ class ShardEngine:
         self,
         client_trades: list[DecrossedTradeRecord],
         prior_state: ShardState | None = None,
+        prior_queue_numpy: np.ndarray | None = None,
     ) -> ShardResult:
         """Run simulation for this shard.
 
         Args:
             client_trades: List of client trades to simulate
             prior_state: Prior day's final state (for state chaining)
+            prior_queue_numpy: Raw numpy FIFO queue (faster than converting from Pydantic)
 
         Returns:
             ShardResult with final state, PnL records, and metrics
@@ -113,32 +124,49 @@ class ShardEngine:
 
         if not timeline:
             # No events to process
-            return self._empty_result(prior_state)
+            return self._empty_result(prior_state, prior_queue_numpy)
 
         # Step 2: Fetch ALL market snapshots (single DuckDB query)
         snapshots = self.market_fetcher.fetch_snapshots(timeline)
 
-        # Step 3: Initialize state
+        # Step 3: Initialize state (avoid deep copy - only copy scalar values)
         if prior_state:
-            state = prior_state.model_copy(deep=True)
-            # Restore FIFO queue to numpy array
-            self.fifo_matcher.queue = self._state_to_numpy(prior_state.fifo_queue)
+            # Create new state with scalar values from prior state (no queue copy)
+            state = ShardState(
+                pair=self.pair,
+                date=self.date,  # Update to current date
+                fifo_queue=[],  # Will be managed via numpy array
+                net_position=prior_state.net_position,
+                cumulative_execution_pnl=prior_state.cumulative_execution_pnl,
+                cumulative_inventory_pnl=prior_state.cumulative_inventory_pnl,
+                cumulative_hedge_pnl=prior_state.cumulative_hedge_pnl,
+                last_timestamp_ms=prior_state.last_timestamp_ms,
+                last_mid=prior_state.last_mid,
+            )
+            # Use raw numpy queue if available (avoids Pydantic conversion overhead)
+            if prior_queue_numpy is not None:
+                self.fifo_matcher.queue = prior_queue_numpy
+            else:
+                self.fifo_matcher.queue = self._state_to_numpy(prior_state.fifo_queue)
         else:
             state = ShardState(pair=self.pair, date=self.date)
 
         # Step 4: Simulation loop with trade-level attribution
-        pnl_records: list[PnLAttributionRecord] = []
+        # Use lightweight dataclasses in hot loop (no Pydantic validation overhead)
+        pnl_records_internal: list[PnLAttributionRecordInternal] = []
         hedge_trades: list[dict] = []
-        recent_trades: list[DecrossedTradeRecord] = []  # Track for hedge attribution
+        recent_trades: dict[str, DecrossedTradeRecord] = {}  # Track for hedge attribution (O(1) lookup)
+        recent_trades_list: list[DecrossedTradeRecord] = []  # Maintained alongside dict to avoid O(n) conversion
 
         for point in timeline:
             snapshot = snapshots[point.timestamp_ms]
-            event_attributions: list[TradePnLAttribution] = []
+            event_attributions: list[TradePnLAttributionInternal] = []
 
             # Process client fill
             if point.event_type == "client_fill":
                 trade = point.client_trade
-                recent_trades.append(trade)
+                recent_trades[trade.source_trade_id] = trade
+                recent_trades_list.append(trade)  # O(1) append instead of O(n) list() conversion
 
                 # Calculate execution PnL (native and reporting)
                 exec_pnl_native, exec_pnl_reporting = self.pnl_calculator.calculate_execution_pnl(
@@ -160,35 +188,31 @@ class ShardEngine:
                 )
 
                 # Create attribution record for this trade
-                trade_attribution = TradePnLAttribution(
+                # Use tuples instead of dicts for hot path efficiency
+                # Side is already from house's perspective (house BUY = +1, house SELL = -1)
+                trade_attribution = TradePnLAttributionInternal(
                     timestamp_ms=trade.timestamp_ms,
                     event_type="client_fill",
                     source_trade_id=trade.source_trade_id,
                     pair=trade.pair,
+                    side=trade.side,  # Already house's perspective
+                    qty=trade.qty,
+                    price=snapshot.mid,
                     native_currency=self.native_currency,
                     reporting_currency=self.config.reporting_currency,
                     fx_rate=snapshot.fx_rate,
-                    metadata={
-                        "order_id": trade.order_id,
-                        "is_direct": trade.is_direct,
-                        "path": trade.path,
-                    },
+                    metadata=(trade.order_id, trade.is_direct, trade.path),  # Tuple: more efficient than dict
                     execution_pnl_native=exec_pnl_native,
                     execution_pnl_reporting=exec_pnl_reporting,
                     inventory_pnl_native=inv_pnl_native,
                     inventory_pnl_reporting=inv_pnl_reporting,
-                    matched_slices=[
-                        {
-                            "slice_source_trade_id": slice_id,
-                            "matched_qty": qty,
-                            "pnl": pnl
-                        }
-                        for slice_id, qty, pnl in match_result.matched_slices
-                    ],
+                    matched_slices=match_result.matched_slices,  # Already list of tuples from FIFO matcher
                 )
                 event_attributions.append(trade_attribution)
 
-                # Update net position
+                # Update net position (side is already from house's perspective)
+                # +1 = house BUYS → position increases
+                # -1 = house SELLS → position decreases
                 state.net_position += trade.qty * trade.side
 
             # Evaluate hedge policy
@@ -211,7 +235,7 @@ class ShardEngine:
                 hedge_allocations = self.pnl_calculator.attribute_hedge_cost_to_trades(
                     hedge_cost_native,
                     hedge_cost_reporting,
-                    recent_trades,
+                    recent_trades_list,  # Use pre-built list (O(1) vs O(n) conversion)
                     state.net_position,
                 )
 
@@ -228,23 +252,20 @@ class ShardEngine:
 
                 # Create attribution records for each trade that triggered hedge
                 for trade_id, (alloc_native, alloc_reporting) in hedge_allocations.items():
-                    source_trade = next(
-                        (t for t in recent_trades if t.source_trade_id == trade_id), None
-                    )
+                    source_trade = recent_trades.get(trade_id)
                     if source_trade:
-                        hedge_attribution = TradePnLAttribution(
+                        hedge_attribution = TradePnLAttributionInternal(
                             timestamp_ms=hedge["timestamp_ms"],
                             event_type="hedge_fill",
                             source_trade_id=trade_id,
                             pair=self.pair,
+                            side=hedge["side"],
+                            qty=hedge["qty"],
+                            price=snapshot.mid,
                             native_currency=self.native_currency,
                             reporting_currency=self.config.reporting_currency,
                             fx_rate=snapshot.fx_rate,
-                            metadata={
-                                "order_id": source_trade.order_id,
-                                "is_direct": source_trade.is_direct,
-                                "path": source_trade.path,
-                            },
+                            metadata=(source_trade.order_id, source_trade.is_direct, source_trade.path),  # Tuple
                             execution_pnl_native=0.0,
                             execution_pnl_reporting=0.0,
                             inventory_pnl_native=0.0,
@@ -260,39 +281,32 @@ class ShardEngine:
                         event_attributions.append(hedge_attribution)
 
                 # Attribute inventory PnL from hedge matching to source trades
-                for slice_id, qty, pnl_native in match_result_hedge.matched_slices:
-                    source_trade = next(
-                        (t for t in recent_trades if t.source_trade_id == slice_id), None
-                    )
+                for slice_id, matched_qty, pnl_native in match_result_hedge.matched_slices:
+                    source_trade = recent_trades.get(slice_id)
                     if source_trade:
                         pnl_reporting = self.pnl_calculator.convert_inventory_pnl(
                             pnl_native, self.pair, snapshot.fx_rate
                         )
 
-                        inv_attribution = TradePnLAttribution(
+                        inv_attribution = TradePnLAttributionInternal(
                             timestamp_ms=hedge["timestamp_ms"],
                             event_type="hedge_match",
                             source_trade_id=slice_id,
                             pair=self.pair,
+                            side=0,  # Matched event, no side change
+                            qty=matched_qty,
+                            price=snapshot.mid,
                             native_currency=self.native_currency,
                             reporting_currency=self.config.reporting_currency,
                             fx_rate=snapshot.fx_rate,
-                            metadata={
-                                "order_id": source_trade.order_id,
-                                "is_direct": source_trade.is_direct,
-                                "path": source_trade.path,
-                            },
+                            metadata=(source_trade.order_id, source_trade.is_direct, source_trade.path),  # Tuple
                             execution_pnl_native=0.0,
                             execution_pnl_reporting=0.0,
                             inventory_pnl_native=pnl_native,
                             inventory_pnl_reporting=pnl_reporting,
                             hedge_pnl_native=0.0,
                             hedge_pnl_reporting=0.0,
-                            matched_slices=[{
-                                "slice_source_trade_id": slice_id,
-                                "matched_qty": qty,
-                                "pnl": pnl_native
-                            }],
+                            matched_slices=[(slice_id, matched_qty, pnl_native)],  # Tuple instead of dict
                         )
                         event_attributions.append(inv_attribution)
 
@@ -301,31 +315,29 @@ class ShardEngine:
                 hedge_trades.append(hedge)
 
             # Sample unrealized PnL with per-slice attribution
-            if point.event_type == "sample":
+            # Skip processing if position is flat (no open slices)
+            if point.event_type == "sample" and len(self.fifo_matcher.queue) > 0:
                 slice_pnls = self.fifo_matcher.calculate_unrealized_pnl(snapshot.mid)
 
                 for slice_id, unrealized_native in slice_pnls:
-                    source_trade = next(
-                        (t for t in recent_trades if t.source_trade_id == slice_id), None
-                    )
+                    source_trade = recent_trades.get(slice_id)
                     if source_trade:
                         unrealized_reporting = self.pnl_calculator.convert_inventory_pnl(
                             unrealized_native, self.pair, snapshot.fx_rate
                         )
 
-                        sample_attribution = TradePnLAttribution(
+                        sample_attribution = TradePnLAttributionInternal(
                             timestamp_ms=point.timestamp_ms,
                             event_type="sample",
                             source_trade_id=slice_id,
                             pair=self.pair,
+                            side=0,  # Sample event, no side change
+                            qty=0.0,  # Sample event, no quantity
+                            price=snapshot.mid,
                             native_currency=self.native_currency,
                             reporting_currency=self.config.reporting_currency,
                             fx_rate=snapshot.fx_rate,
-                            metadata={
-                                "order_id": source_trade.order_id,
-                                "is_direct": source_trade.is_direct,
-                                "path": source_trade.path,
-                            },
+                            metadata=(source_trade.order_id, source_trade.is_direct, source_trade.path),  # Tuple
                             execution_pnl_native=0.0,
                             execution_pnl_reporting=0.0,
                             inventory_pnl_native=0.0,
@@ -339,24 +351,24 @@ class ShardEngine:
 
             # Create PnL attribution record for this event
             if event_attributions:
-                pnl_record = PnLAttributionRecord(
+                # Single-pass accumulation instead of 4 separate sum() calls
+                total_exec = total_inv = total_hedge = total_unreal = 0.0
+                for attr in event_attributions:
+                    total_exec += attr.execution_pnl_reporting
+                    total_inv += attr.inventory_pnl_reporting
+                    total_hedge += attr.hedge_pnl_reporting
+                    total_unreal += attr.unrealized_pnl_reporting
+
+                pnl_record = PnLAttributionRecordInternal(
                     timestamp_ms=point.timestamp_ms,
                     event_type=point.event_type,
                     trade_attributions=event_attributions,
-                    total_execution_pnl_reporting=sum(
-                        a.execution_pnl_reporting for a in event_attributions
-                    ),
-                    total_inventory_pnl_reporting=sum(
-                        a.inventory_pnl_reporting for a in event_attributions
-                    ),
-                    total_hedge_pnl_reporting=sum(
-                        a.hedge_pnl_reporting for a in event_attributions
-                    ),
-                    total_unrealized_pnl_reporting=sum(
-                        a.unrealized_pnl_reporting for a in event_attributions
-                    ),
+                    total_execution_pnl_reporting=total_exec,
+                    total_inventory_pnl_reporting=total_inv,
+                    total_hedge_pnl_reporting=total_hedge,
+                    total_unrealized_pnl_reporting=total_unreal,
                 )
-                pnl_records.append(pnl_record)
+                pnl_records_internal.append(pnl_record)
 
             # Update state
             state.last_timestamp_ms = point.timestamp_ms
@@ -364,19 +376,25 @@ class ShardEngine:
 
         # Step 5: Update cumulative PnL (in reporting currency)
         state.cumulative_execution_pnl = sum(
-            r.total_execution_pnl_reporting for r in pnl_records
+            r.total_execution_pnl_reporting for r in pnl_records_internal
         )
         state.cumulative_inventory_pnl = sum(
-            r.total_inventory_pnl_reporting for r in pnl_records
+            r.total_inventory_pnl_reporting for r in pnl_records_internal
         )
         state.cumulative_hedge_pnl = sum(
-            r.total_hedge_pnl_reporting for r in pnl_records
+            r.total_hedge_pnl_reporting for r in pnl_records_internal
         )
 
-        # Step 6: Convert FIFO queue back to state
+        # Step 6: Store numpy queue for efficient chaining (avoid Pydantic conversion at shard boundary)
+        final_queue_numpy = self.fifo_matcher.queue.copy() if len(self.fifo_matcher.queue) > 0 else None
+
+        # Step 7: Convert FIFO queue to Pydantic for state serialization
         state.fifo_queue = self._numpy_to_state(self.fifo_matcher.queue)
 
-        # Step 7: Calculate metrics
+        # Step 8: Convert internal records to Pydantic for API output
+        pnl_records = convert_records_to_pydantic(pnl_records_internal)
+
+        # Step 9: Calculate metrics
         metrics = self._calculate_metrics(pnl_records, state, client_trades, hedge_trades)
 
         return ShardResult(
@@ -385,6 +403,7 @@ class ShardEngine:
             final_state=state,
             pnl_records=pnl_records,
             metrics=metrics,
+            fifo_queue_numpy=final_queue_numpy,  # For efficient state chaining
         )
 
     def _state_to_numpy(self, fifo_queue: list[FIFOSlice]) -> np.ndarray:
@@ -507,11 +526,16 @@ class ShardEngine:
             "hedge_trade_count": len(hedge_trades),
         }
 
-    def _empty_result(self, prior_state: ShardState | None) -> ShardResult:
+    def _empty_result(
+        self,
+        prior_state: ShardState | None,
+        prior_queue_numpy: np.ndarray | None = None,
+    ) -> ShardResult:
         """Create empty result when no trades to process.
 
         Args:
             prior_state: Prior state (if any)
+            prior_queue_numpy: Raw numpy FIFO queue (for efficient chaining)
 
         Returns:
             Empty ShardResult
@@ -539,4 +563,5 @@ class ShardEngine:
                 "client_trade_count": 0,
                 "hedge_trade_count": 0,
             },
+            fifo_queue_numpy=prior_queue_numpy,  # Pass through for chaining
         )

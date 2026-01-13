@@ -6,6 +6,7 @@ with support for idempotence detection via config hashing.
 
 import hashlib
 import json
+import logging
 import secrets
 import shutil
 from datetime import datetime
@@ -14,8 +15,11 @@ from typing import Any
 
 from pydantic import BaseModel
 
+logger = logging.getLogger(__name__)
+
 from ..config.run_config import RunConfig, RunStatus
-from .run_models import FailedShardDetail, RunRecord
+from .run_models import DecrossProgress, FailedShardDetail, RunRecord
+from ...util.time import now_ms
 
 
 class RunNotFoundError(Exception):
@@ -161,13 +165,13 @@ class RunRegistry:
         run_dir.mkdir(parents=True)
 
         config_hash = compute_config_hash(config)
-        now_ms = int(datetime.utcnow().timestamp() * 1000)
+        current_time_ms = now_ms()
 
         record = RunRecord(
             run_id=run_id,
             config_hash=config_hash,
             status=RunStatus.CREATED,
-            created_at_ms=now_ms,
+            created_at_ms=current_time_ms,
             config=config,
         )
 
@@ -243,6 +247,18 @@ class RunRegistry:
             FailedShardDetail(**d) for d in status_data.get("failed_shard_details", [])
         ]
 
+        # Parse decross_progress (with backward compatibility)
+        decross_data = status_data.get("decross_progress", {})
+        decross_progress = DecrossProgress(
+            status=decross_data.get("status", "pending"),
+            total_dates=decross_data.get("total_dates", 0),
+            completed_dates=decross_data.get("completed_dates", 0),
+            current_date=decross_data.get("current_date"),
+            started_at_ms=decross_data.get("started_at_ms"),
+            completed_at_ms=decross_data.get("completed_at_ms"),
+            error=decross_data.get("error"),
+        )
+
         return RunRecord(
             run_id=run_id,
             config_hash=status_data["config_hash"],
@@ -250,9 +266,11 @@ class RunRegistry:
             created_at_ms=status_data["created_at_ms"],
             started_at_ms=status_data.get("started_at_ms"),
             completed_at_ms=status_data.get("completed_at_ms"),
+            decross_progress=decross_progress,
             total_shards=status_data.get("total_shards", 0),
             completed_shards=status_data.get("completed_shards", 0),
             failed_shards=status_data.get("failed_shards", 0),
+            current_stage=status_data.get("current_stage"),
             error_message=status_data.get("error_message"),
             failed_shard_details=failed_details,
             config=RunConfig(**config_data),
@@ -278,6 +296,9 @@ class RunRegistry:
         Raises:
             RunNotFoundError: If run doesn't exist
         """
+        logger.info(f"[REGISTRY] update_status called: run_id={run_id}, status={status.value}")
+        print(f"[REGISTRY] update_status called: run_id={run_id}, status={status.value}", flush=True)
+
         record = self.get_run(run_id)
         record.status = status
 
@@ -286,6 +307,8 @@ class RunRegistry:
                 setattr(record, key, value)
 
         self._write_status(run_id, record)
+        logger.info(f"[REGISTRY] Status written successfully for run {run_id}")
+        print(f"[REGISTRY] Status written successfully for run {run_id}", flush=True)
         return record
 
     def update_progress(
@@ -315,6 +338,21 @@ class RunRegistry:
         if total_shards is not None:
             record.total_shards = total_shards
 
+        self._write_status(run_id, record)
+        return record
+
+    def update_stage(self, run_id: str, stage: str) -> RunRecord:
+        """Update the current stage of the run.
+
+        Args:
+            run_id: Run identifier
+            stage: Current stage (decrossing, simulating, computing_metrics, writing_results)
+
+        Returns:
+            Updated RunRecord
+        """
+        record = self.get_run(run_id)
+        record.current_stage = stage
         self._write_status(run_id, record)
         return record
 
@@ -450,9 +488,19 @@ class RunRegistry:
             "created_at_ms": record.created_at_ms,
             "started_at_ms": record.started_at_ms,
             "completed_at_ms": record.completed_at_ms,
+            "decross_progress": {
+                "status": record.decross_progress.status,
+                "total_dates": record.decross_progress.total_dates,
+                "completed_dates": record.decross_progress.completed_dates,
+                "current_date": record.decross_progress.current_date,
+                "started_at_ms": record.decross_progress.started_at_ms,
+                "completed_at_ms": record.decross_progress.completed_at_ms,
+                "error": record.decross_progress.error,
+            },
             "total_shards": record.total_shards,
             "completed_shards": record.completed_shards,
             "failed_shards": record.failed_shards,
+            "current_stage": record.current_stage,
             "error_message": record.error_message,
             "failed_shard_details": [
                 d.model_dump() for d in record.failed_shard_details
@@ -463,3 +511,63 @@ class RunRegistry:
         temp_file = status_file.with_suffix(".tmp")
         temp_file.write_text(json.dumps(status_data, indent=2))
         temp_file.replace(status_file)
+
+    def update_decross_progress(
+        self,
+        run_id: str,
+        completed_dates: int,
+        total_dates: int,
+        current_date: str | None = None,
+    ) -> RunRecord:
+        """Update decrossing progress.
+
+        Args:
+            run_id: Run identifier
+            completed_dates: Number of dates completed
+            total_dates: Total number of dates to process
+            current_date: Currently processing date
+
+        Returns:
+            Updated RunRecord
+        """
+        record = self.get_run(run_id)
+
+        record.decross_progress.completed_dates = completed_dates
+        record.decross_progress.total_dates = total_dates
+        record.decross_progress.current_date = current_date
+
+        # Set status to running if not already
+        if record.decross_progress.status == "pending":
+            record.decross_progress.status = "running"
+            record.decross_progress.started_at_ms = now_ms()
+
+        self._write_status(run_id, record)
+        return record
+
+    def complete_decrossing(
+        self,
+        run_id: str,
+        success: bool = True,
+        error: str | None = None,
+    ) -> RunRecord:
+        """Mark decrossing as complete.
+
+        Args:
+            run_id: Run identifier
+            success: Whether decrossing succeeded
+            error: Optional error message if failed
+
+        Returns:
+            Updated RunRecord
+        """
+        record = self.get_run(run_id)
+
+        record.decross_progress.status = "completed" if success else "failed"
+        record.decross_progress.completed_at_ms = now_ms()
+        record.decross_progress.current_date = None
+
+        if error:
+            record.decross_progress.error = error
+
+        self._write_status(run_id, record)
+        return record

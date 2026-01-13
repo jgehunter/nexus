@@ -66,43 +66,47 @@ class PnLCalculator:
     ) -> tuple[float, float]:
         """Calculate execution PnL in both native and reporting currency.
 
-        Execution PnL is the difference between the actual fill price and
-        the mid price at execution time.
+        Execution PnL is the spread captured when filling client orders.
+        This is from the HOUSE's perspective as market maker.
 
         Args:
             exec_price: Actual execution price
             exec_mid: Mid price at execution
             qty: Trade quantity
-            side: Trade side (+1 buy, -1 sell)
+            side: Trade side from HOUSE's perspective (+1 = house buys, -1 = house sells)
             pair: Currency pair (for determining native currency)
             fx_rate: FX rate for conversion
 
         Returns:
             Tuple of (pnl_native, pnl_reporting)
 
+        Side Convention:
+            side = +1: House BUYS base currency (client sells to us)
+                       Positive PnL if we bought below mid
+            side = -1: House SELLS base currency (client buys from us)
+                       Positive PnL if we sold above mid
+
         Example:
             >>> calc = PnLCalculator(FXConverter("USD"))
-            >>> # EURUSD: buy at 1.1005, mid was 1.1000
+            >>> # House SELLS EURUSD at 1.1005 when mid was 1.1000 (sold above mid = profit)
             >>> pnl_native, pnl_reporting = calc.calculate_execution_pnl(
-            ...     1.1005, 1.1000, 1000.0, 1, "EURUSD", 1.0
+            ...     1.1005, 1.1000, 1000.0, -1, "EURUSD", 1.0
             ... )
             >>> pnl_native
-            5.0  # (1.1005 - 1.1000) * 1000 * 1 = +5 USD
-            >>> pnl_reporting
-            5.0  # Same since EURUSD PnL is already in USD
+            5.0  # Sold 0.0005 above mid * 1000 = +5 USD
 
-            >>> # EURGBP: sell at 0.8795, mid was 0.8800
-            >>> # GBPUSD rate = 1.25 for conversion
+            >>> # House BUYS EURUSD at 1.0995 when mid was 1.1000 (bought below mid = profit)
             >>> pnl_native, pnl_reporting = calc.calculate_execution_pnl(
-            ...     0.8795, 0.8800, 1000.0, -1, "EURGBP", 1.25
+            ...     1.0995, 1.1000, 1000.0, 1, "EURUSD", 1.0
             ... )
             >>> pnl_native
-            5.0  # (0.8795 - 0.8800) * 1000 * -1 = +5 GBP
-            >>> pnl_reporting
-            6.25  # 5 GBP * 1.25 = 6.25 USD
+            5.0  # Bought 0.0005 below mid * 1000 = +5 USD
         """
         # Calculate PnL in native currency (quote currency)
-        pnl_native = (exec_price - exec_mid) * qty * side
+        # Formula: (exec_price - exec_mid) * qty * (-side)
+        # - House SELLS (-1) above mid: (positive) * qty * (+1) = positive profit
+        # - House BUYS (+1) below mid: (negative) * qty * (-1) = positive profit
+        pnl_native = (exec_price - exec_mid) * qty * (-side)
 
         # Convert to reporting currency
         pnl_reporting, _ = self.fx_converter.convert_pnl(pnl_native, fx_rate, pair)

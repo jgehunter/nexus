@@ -15,6 +15,11 @@ class CurrencyFlowTracker:
     Handles the complex logic of determining quantities, sides, and prices
     for each leg in a multi-hop currency path, ensuring proper currency
     flow and conservation.
+
+    Side Convention:
+        Uses HOUSE's perspective throughout:
+        - side = +1: House BUYS base currency
+        - side = -1: House SELLS base currency
     """
 
     def __init__(self, original_trade: TradeRecord, path: CurrencyPath):
@@ -80,7 +85,8 @@ class CurrencyFlowTracker:
         """Calculate parameters for the first leg.
 
         The first leg always involves the original trade's base currency
-        and quantity.
+        and quantity. Uses mid price for all legs (backsolving will adjust
+        the last leg to match original rate).
 
         Args:
             pair: Direct pair for this leg
@@ -93,31 +99,30 @@ class CurrencyFlowTracker:
         pair_base = get_base_currency(pair)
         pair_quote = get_quote_currency(pair)
 
-        if self.original_side == 1:  # BUY base currency
+        if self.original_side == 1:  # BUY base currency of original trade
             # We're buying the base currency, selling the quote
             if not is_inverted:  # EURUSD: EUR is base
                 # BUY EUR (base of EURUSD)
                 leg_side = 1
                 leg_qty = self.original_qty
-                market_price = tick.ask_tob  # Buying at ask
-            else:  # USDEUR: EUR is quote
-                # To buy EUR (quote), we SELL USD (base)
+                market_price = tick.mid  # Use mid price
+            else:  # Path is inverted relative to pair
+                # To buy the original base (which is pair's quote), we SELL pair's base
                 leg_side = -1
-                # Need to calculate USD quantity needed
-                # EUR qty / EUR_per_USD = USD qty
+                # Need to calculate pair base quantity needed
                 leg_qty = self.original_qty / tick.mid
-                market_price = tick.bid_tob  # Selling at bid
-        else:  # SELL base currency (original_side == -1)
+                market_price = tick.mid  # Use mid price
+        else:  # SELL base currency of original trade (original_side == -1)
             if not is_inverted:  # EURUSD: EUR is base
                 # SELL EUR (base of EURUSD)
                 leg_side = -1
                 leg_qty = self.original_qty
-                market_price = tick.bid_tob  # Selling at bid
-            else:  # USDEUR: EUR is quote
-                # To sell EUR (quote), we BUY USD (base)
+                market_price = tick.mid  # Use mid price
+            else:  # Path is inverted relative to pair
+                # To sell the original base (which is pair's quote), we BUY pair's base
                 leg_side = 1
                 leg_qty = self.original_qty / tick.mid
-                market_price = tick.ask_tob  # Buying at ask
+                market_price = tick.mid  # Use mid price
 
         return (pair, leg_side, leg_qty, market_price)
 
@@ -145,11 +150,26 @@ class CurrencyFlowTracker:
 
         Returns:
             Tuple of (pair, side, qty, market_price)
+
+        Currency flow analysis:
+        - intermediate_qty is in path.currencies[leg_index] (the "from" currency)
+        - leg_qty must be in the BASE currency of the pair
+
+        For non-inverted edge (from_curr→to_curr via pair):
+            - pair = from_curr + to_curr (base=from_curr, quote=to_curr)
+            - intermediate_qty is in from_curr = base of pair
+            - leg_qty = intermediate_qty (already in base currency)
+
+        For inverted edge (from_curr→to_curr via pair):
+            - pair = to_curr + from_curr (base=to_curr, quote=from_curr)
+            - intermediate_qty is in from_curr = quote of pair
+            - leg_qty = intermediate_qty / mid (convert quote to base)
         """
         pair_base = get_base_currency(pair)
         pair_quote = get_quote_currency(pair)
 
         # Calculate quantity in intermediate currency from previous legs
+        # This gives us quantity in path.currencies[leg_index]
         intermediate_qty = self._calculate_intermediate_qty(
             leg_index, path, market_ticks
         )
@@ -159,37 +179,42 @@ class CurrencyFlowTracker:
         to_curr = path.currencies[leg_index + 1]
 
         # Determine side and quantity based on original intent and pair structure
-        if self.original_side == 1:  # Original intent: BUY final currency
-            # We need to convert intermediate → final (buy final, sell intermediate)
+        if self.original_side == 1:  # Original intent: BUY base of cross pair
+            # Money flows backwards through path: we acquire base, pay with quote
             if not is_inverted:
-                # Pair is from_curr → to_curr (e.g., USD → GBP via USDGBP)
-                # We're buying to_curr (the pair's base)
-                leg_side = 1  # BUY base
-                # We have intermediate_qty of from_curr to spend
-                # Need to calculate how much base we can buy
-                leg_qty = intermediate_qty / tick.mid
-                market_price = tick.ask_tob  # Buying at ask
+                # Non-inverted: pair base = from_curr
+                # We BUY base (from_curr) with quote (to_curr)
+                # But for intermediate legs, we're providing from_curr to acquire earlier currencies
+                # Actually we need to SELL from_curr to get what we need
+                leg_side = 1  # BUY base (acquiring the from_curr we need)
+                # intermediate_qty is in from_curr = base of pair
+                leg_qty = intermediate_qty  # Already in base currency
+                market_price = tick.mid  # Use mid for quantity calc
             else:
-                # Pair is to_curr → from_curr (e.g., GBP → USD via GBPUSD, inverted)
-                # We're selling from_curr (the pair's quote when inverted)
-                # Which means selling the pair's base in normal terms
-                leg_side = -1  # SELL base (to get quote)
-                leg_qty = intermediate_qty
-                market_price = tick.bid_tob  # Selling at bid
-        else:  # Original intent: SELL final currency (original_side == -1)
-            # We need to convert intermediate → final (sell final, buy intermediate)
-            if not is_inverted:
-                # Pair is from_curr → to_curr
-                # We're selling to_curr (the pair's base)
+                # Inverted: pair base = to_curr, pair quote = from_curr
+                # We SELL base (to_curr) to provide quote (from_curr)
                 leg_side = -1  # SELL base
+                # intermediate_qty is in from_curr = quote of pair
+                # Convert from quote to base: base_qty = quote_qty / rate
                 leg_qty = intermediate_qty / tick.mid
-                market_price = tick.bid_tob  # Selling at bid
+                market_price = tick.mid  # Use mid for quantity calc
+        else:  # Original intent: SELL base of cross pair (original_side == -1)
+            # Money flows forward through path: we sell base, receive quote
+            if not is_inverted:
+                # Non-inverted: pair base = from_curr
+                # We SELL base (from_curr) to get quote (to_curr)
+                leg_side = -1  # SELL base
+                # intermediate_qty is in from_curr = base of pair
+                leg_qty = intermediate_qty  # Already in base currency
+                market_price = tick.mid  # Use mid for quantity calc
             else:
-                # Pair is to_curr → from_curr (inverted)
-                # We're buying from_curr
+                # Inverted: pair base = to_curr, pair quote = from_curr
+                # We BUY base (to_curr) with quote (from_curr)
                 leg_side = 1  # BUY base
-                leg_qty = intermediate_qty
-                market_price = tick.ask_tob  # Buying at ask
+                # intermediate_qty is in from_curr = quote of pair
+                # Convert from quote to base: base_qty = quote_qty / rate
+                leg_qty = intermediate_qty / tick.mid
+                market_price = tick.mid  # Use mid for quantity calc
 
         return (pair, leg_side, leg_qty, market_price)
 
@@ -244,8 +269,8 @@ class CurrencyFlowTracker:
     ) -> bool:
         """Validate that quantities conserve across legs.
 
-        Checks that the intermediate currency quantities balance
-        at each hop in the path.
+        Checks that each leg's quantity matches the expected quantity based on
+        the currency flow through the path.
 
         Args:
             legs: List of leg dicts with qty, side, pair
@@ -257,30 +282,42 @@ class CurrencyFlowTracker:
             True if quantities conserve, False otherwise
 
         Example:
-            Leg 0: BUY 1000 EUR, sell 1100 USD (EURUSD @ 1.10)
-            Leg 1: BUY 880 GBP, sell 1100 USD (GBPUSD @ 1.25)
-            Check: Both legs involve same USD quantity (1100)
+            BUY 1000 EURGBP via EUR→USD→GBP (EURUSD @ 1.10, GBPUSD @ 1.25)
+            Leg 0: BUY 1000 EUR via EURUSD
+            Leg 1: SELL 880 GBP via GBPUSD (1000 * 1.10 / 1.25 = 880)
+            Check: Leg quantities match expected flow
         """
         if len(legs) < 2:
             return True  # Single leg always conserves
 
-        # For each intermediate currency, check that input = output
-        for i in range(1, len(legs)):
-            prev_leg = legs[i - 1]
-            curr_leg = legs[i]
+        # Validate each leg's quantity matches expected from currency flow
+        for i, leg in enumerate(legs):
+            is_inverted = path.inversions[i]
+            tick = market_ticks[leg["pair"]]
 
-            # Calculate output quantity from previous leg
-            prev_pair = prev_leg["pair"]
-            prev_tick = market_ticks[prev_pair]
-            prev_output_qty = prev_leg["qty"] * prev_tick.mid
+            if i == 0:
+                # First leg: quantity should be original_qty or original_qty / mid for inverted
+                if not is_inverted:
+                    expected_qty = self.original_qty
+                else:
+                    expected_qty = self.original_qty / tick.mid
+            else:
+                # Intermediate/final legs: calculate from intermediate quantity
+                # intermediate_qty is in path.currencies[i]
+                intermediate_qty = self._calculate_intermediate_qty(i, path, market_ticks)
 
-            # Calculate input quantity to current leg
-            curr_input_qty = curr_leg["qty"]
+                if not is_inverted:
+                    # Non-inverted: intermediate_qty is in base of pair
+                    expected_qty = intermediate_qty
+                else:
+                    # Inverted: intermediate_qty is in quote of pair, need to convert to base
+                    expected_qty = intermediate_qty / tick.mid
 
-            # Check if they match (within tolerance)
-            if prev_output_qty == 0:
+            # Check if actual matches expected
+            actual_qty = leg["qty"]
+            if expected_qty == 0:
                 return False
-            if abs(prev_output_qty - curr_input_qty) / prev_output_qty > tolerance:
+            if abs(actual_qty - expected_qty) / expected_qty > tolerance:
                 return False
 
         return True

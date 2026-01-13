@@ -397,8 +397,9 @@ class TestFIFOMatcher:
         """Test processing fill from DecrossedTradeRecord."""
         matcher = FIFOMatcher()
 
-        # First fill: BUY 1000
-        trade1 = create_test_trade("T001", 1704110400000, 1, 1000.0, 1.1005)
+        # First fill: House SELLS 1000 (client buys from us)
+        # side=-1 means house SELLS base currency (going short)
+        trade1 = create_test_trade("T001", 1704110400000, -1, 1000.0, 1.1005)
         snapshot1 = MarketSnapshot(
             timestamp_ms=1704110400000,
             pair="EURUSD",
@@ -415,8 +416,9 @@ class TestFIFOMatcher:
         assert abs(result1.inventory_pnl) < 1e-8
         assert len(matcher.queue) == 1
 
-        # Second fill: SELL 500
-        trade2 = create_test_trade("T002", 1704110460000, -1, 500.0, 1.0995)
+        # Second fill: House BUYS 500 (client sells to us)
+        # side=+1 means house BUYS base currency (going long)
+        trade2 = create_test_trade("T002", 1704110460000, 1, 500.0, 1.0995)
         snapshot2 = MarketSnapshot(
             timestamp_ms=1704110460000,
             pair="EURUSD",
@@ -430,8 +432,11 @@ class TestFIFOMatcher:
         result2 = matcher.process_fill(trade2, snapshot2, is_hedge=False)
 
         # Expected: match 500 from first fill
-        # inventory_pnl = (1.1020 - 1.1000) * 500 * 1 = +1.0
-        assert abs(result2.inventory_pnl - 1.0) < 1e-8
+        # First fill: house SOLD at open_mid=1.1000 (slice.side = -1)
+        # Second fill: house BUYS (incoming side = +1), which matches the SHORT slice
+        # inventory_pnl = (1.1020 - 1.1000) * 500 * (-1) = -1.0
+        # (house was short, price went up, house loses on inventory)
+        assert abs(result2.inventory_pnl - (-1.0)) < 1e-8
         assert len(matcher.queue) == 1  # 500 remaining from first fill
         assert len(result2.matched_slices) == 1
 

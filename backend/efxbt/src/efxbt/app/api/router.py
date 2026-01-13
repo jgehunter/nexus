@@ -7,6 +7,7 @@ from .endpoints import (
     datasets,
     decross,
     health,
+    kpi,
     results,
     runs,
     sweeps,
@@ -26,4 +27,5 @@ api_router.include_router(data_health.router, prefix="/data-health")
 api_router.include_router(decross.router, prefix="/decross")
 api_router.include_router(runs.router, prefix="/runs")
 api_router.include_router(results.router, prefix="/results")
+api_router.include_router(kpi.router, prefix="/kpi")
 api_router.include_router(sweeps.router, prefix="/sweeps")
