@@ -94,17 +94,56 @@ Market data and trade books are **completely independent entities**:
 backend/efxbt/src/efxbt/
 ├── app/
 │   ├── main.py              # FastAPI app factory
-│   ├── services/            # Business logic (datasets.py, tradebooks.py)
+│   ├── services/            # Business logic
+│   │   ├── datasets.py      # Dataset service
+│   │   ├── tradebooks.py    # Tradebook service
+│   │   ├── runs.py          # Run management service
+│   │   ├── decross.py       # Trade decrossing service
+│   │   └── risk_metrics.py  # Risk metrics calculation service
 │   └── api/
 │       ├── router.py        # Aggregates all endpoints
 │       ├── deps.py          # Dependency injection
 │       ├── models.py        # Response models
-│       └── endpoints/       # Route handlers (health, datasets, tradebooks, etc.)
+│       ├── errors.py        # Error handling
+│       └── endpoints/       # Route handlers (health, datasets, tradebooks, runs, results, kpi, etc.)
 ├── core/
+│   ├── cache/               # Caching layer
+│   │   ├── health_cache.py  # Health check caching
+│   │   └── registry_cache.py # Registry data caching
 │   ├── config/              # Settings via pydantic-settings (EFXBT_ prefix)
-│   └── data/
-│       ├── schemas.py       # Pydantic + PyArrow schemas
-│       └── registry.py      # MarketDatasetRegistry, TradeBookRegistry
+│   ├── data/
+│   │   ├── schemas.py       # Pydantic + PyArrow schemas
+│   │   ├── registry.py      # MarketDatasetRegistry, TradeBookRegistry
+│   │   ├── run_registry.py  # Run registry management
+│   │   ├── run_models.py    # Run data models
+│   │   ├── duck.py          # DuckDB utilities
+│   │   └── market_health.py # Market data health checks
+│   ├── graph/               # Currency graph and pathfinding
+│   │   ├── currency_graph.py # Currency relationship graph
+│   │   ├── pathfinding.py   # Path finding algorithms
+│   │   └── schemas.py       # Graph schemas
+│   └── kpi/                 # KPI definitions and registry
+│       └── definitions.py   # KPI metric definitions
+├── engine/                  # Simulation engine
+│   ├── decrosser.py         # Trade decrossing logic
+│   ├── currency_flow.py     # Currency flow calculations
+│   ├── io/                  # I/O utilities
+│   │   └── pnl_writer.py    # PnL output writer
+│   ├── orchestration/       # Run orchestration
+│   │   └── orchestrator.py  # Multi-shard orchestration
+│   ├── shard/               # Per-shard simulation
+│   │   ├── shard_engine.py  # Main shard engine
+│   │   ├── state.py         # Shard state management
+│   │   ├── timeline.py      # Event timeline
+│   │   ├── hedge_policy.py  # Hedging policy implementation
+│   │   ├── fifo_matcher.py  # FIFO matching (Numba JIT)
+│   │   ├── pnl_calculator.py # PnL calculations
+│   │   ├── market_cache.py  # Market data cache
+│   │   ├── market_fetcher.py # Market data fetching
+│   │   └── fx_converter.py  # FX conversion utilities
+│   └── simulation/          # Simulation execution
+│       ├── simulator.py     # Main simulator
+│       └── metrics.py       # Simulation metrics
 └── util/                    # Logging, hashing, time utilities
 ```
 
@@ -144,6 +183,7 @@ frontend/src/
 | EFXBT_DEBUG | true | Enable debug mode |
 | EFXBT_DATA_ROOT | ../../data | Data directory |
 | EFXBT_RESULTS_ROOT | ../../results | Results directory |
+| EFXBT_DUCKDB_MEMORY_LIMIT | 4GB | Memory limit for DuckDB queries |
 
 ---
 
