@@ -415,11 +415,11 @@ class DecrossService:
                 if not batch:
                     break
 
+                # Build TradeRecord list for the entire batch
+                trades: list[TradeRecord] = []
                 for row in batch:
                     timestamp_ms, pair, side, qty, price, trade_id, order_id = row
-
-                    # Build TradeRecord
-                    trade = TradeRecord(
+                    trades.append(TradeRecord(
                         timestamp_ms=int(timestamp_ms),
                         pair=str(pair),
                         side=int(side),
@@ -427,13 +427,16 @@ class DecrossService:
                         price=float(price),
                         trade_id=str(trade_id),
                         order_id=str(order_id) if order_id else None,
-                    )
+                    ))
 
-                    # Fetch ticks for this trade (bounded query)
-                    try:
-                        ticks = self._fetch_ticks_for_trade(trade, graph, conn)
-                    except ValueError as e:
-                        print(f"Warning: Failed to get ticks for trade {trade.trade_id}: {e}")
+                # Fetch ticks for all trades in batch using single ASOF JOIN
+                all_ticks = self._fetch_ticks_for_batch(trades, graph, conn)
+
+                # Process each trade with its pre-fetched ticks
+                for trade in trades:
+                    ticks = all_ticks.get(trade.trade_id)
+                    if ticks is None:
+                        # Trade was skipped due to missing path or ticks
                         continue
 
                     # Decross the trade
@@ -508,6 +511,131 @@ class DecrossService:
             )
 
         return ticks
+
+    def _fetch_ticks_for_batch(
+        self,
+        trades: list[TradeRecord],
+        graph: CurrencyGraph,
+        conn,
+    ) -> dict[str, dict[str, MarketTickRecord]]:
+        """Fetch ticks for a batch of trades using a single ASOF JOIN.
+
+        This method replaces per-trade queries with a single batched query,
+        following the architectural pattern: "DuckDB for batched ASOF joins
+        (no per-event DB queries)".
+
+        Args:
+            trades: List of trade records
+            graph: Currency graph
+            conn: DuckDB connection
+
+        Returns:
+            Dict of {trade_id: {pair: MarketTickRecord}}. Trades with missing
+            ticks are omitted from the result.
+        """
+        if not trades:
+            return {}
+
+        # Step 1: Pre-compute decomposition paths for all unique trade pairs
+        unique_trade_pairs = {trade.pair for trade in trades}
+        pair_to_path_pairs: dict[str, list[str] | None] = {}
+
+        for trade_pair in unique_trade_pairs:
+            base_curr = get_base_currency(trade_pair)
+            quote_curr = get_quote_currency(trade_pair)
+            path_pairs, _ = self._get_or_compute_path(base_curr, quote_curr, graph)
+            pair_to_path_pairs[trade_pair] = path_pairs
+
+        # Step 2: Build (trade_id, timestamp_ms, needed_pair) tuples for all trades
+        trades_pairs_data: list[tuple[str, int, str]] = []
+        trades_with_no_path: set[str] = set()
+
+        for trade in trades:
+            path_pairs = pair_to_path_pairs.get(trade.pair)
+            if path_pairs is None:
+                trades_with_no_path.add(trade.trade_id)
+                continue
+            for needed_pair in path_pairs:
+                trades_pairs_data.append((trade.trade_id, trade.timestamp_ms, needed_pair))
+
+        if not trades_pairs_data:
+            return {}
+
+        # Step 3: Build VALUES clause for the CTE
+        # Format: ('trade_id', timestamp_ms, 'pair')
+        values_rows = ", ".join(
+            f"('{tid}', {ts}, '{pair}')"
+            for tid, ts, pair in trades_pairs_data
+        )
+
+        # Step 4: Execute single ASOF JOIN query
+        query = f"""
+        WITH trades_pairs AS (
+            SELECT * FROM (VALUES
+                {values_rows}
+            ) AS t(trade_id, timestamp_ms, needed_pair)
+        )
+        SELECT
+            tp.trade_id,
+            tp.needed_pair,
+            m.timestamp_ms AS tick_ts,
+            m.bid_tob,
+            m.ask_tob,
+            m.bid_qty_tob,
+            m.ask_qty_tob
+        FROM trades_pairs tp
+        ASOF LEFT JOIN market m
+            ON tp.needed_pair = m.pair
+            AND tp.timestamp_ms >= m.timestamp_ms
+        """
+
+        result = conn.execute(query).fetchall()
+
+        # Step 5: Group results by trade_id
+        all_ticks: dict[str, dict[str, MarketTickRecord]] = {}
+        missing_ticks: list[tuple[str, str]] = []  # (trade_id, pair) with missing data
+
+        for row in result:
+            trade_id, needed_pair, tick_ts, bid, ask, bid_qty, ask_qty = row
+
+            if tick_ts is None:
+                # No tick found for this pair at this timestamp
+                missing_ticks.append((trade_id, needed_pair))
+                continue
+
+            if trade_id not in all_ticks:
+                all_ticks[trade_id] = {}
+
+            all_ticks[trade_id][needed_pair] = MarketTickRecord(
+                timestamp_ms=tick_ts,
+                pair=needed_pair,
+                bid_tob=bid,
+                ask_tob=ask,
+                bid_qty_tob=bid_qty,
+                ask_qty_tob=ask_qty,
+            )
+
+        # Log warnings for missing ticks
+        if missing_ticks:
+            for trade_id, pair in missing_ticks[:5]:  # Limit warnings
+                print(f"Warning: No tick for {pair} for trade {trade_id}")
+            if len(missing_ticks) > 5:
+                print(f"Warning: ... and {len(missing_ticks) - 5} more missing ticks")
+
+        # Remove trades that have incomplete tick data
+        trade_to_expected_pairs: dict[str, set[str]] = {}
+        for trade in trades:
+            path_pairs = pair_to_path_pairs.get(trade.pair)
+            if path_pairs:
+                trade_to_expected_pairs[trade.trade_id] = set(path_pairs)
+
+        complete_ticks: dict[str, dict[str, MarketTickRecord]] = {}
+        for trade_id, ticks in all_ticks.items():
+            expected = trade_to_expected_pairs.get(trade_id, set())
+            if set(ticks.keys()) == expected:
+                complete_ticks[trade_id] = ticks
+
+        return complete_ticks
 
     def _append_to_output(
         self,
