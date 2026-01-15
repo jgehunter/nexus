@@ -138,6 +138,7 @@ def execute_pair_shards(
     from ...core.data.schemas import DecrossedTradeRecord
 
     prior_state: ShardState | None = None
+    prior_pending_hedges: list[tuple[int, dict, dict]] | None = None  # (execute_at, hedge, snapshot_dict)
     aggregated_metrics: dict[str, float] = {
         "execution_pnl_reporting": 0.0,
         "inventory_pnl_reporting": 0.0,
@@ -168,8 +169,12 @@ def execute_pair_shards(
                     data_root=Path(data_root),
                 )
 
-                # Run with state chaining
-                result = engine.run(client_trades, prior_state)
+                # Run with state chaining (includes pending hedges from prior day)
+                result = engine.run(
+                    client_trades,
+                    prior_state,
+                    prior_pending_hedges=prior_pending_hedges,
+                )
 
                 # Stream PnL records to disk instead of accumulating
                 writer.write_records(result.pnl_records)
@@ -184,8 +189,9 @@ def execute_pair_shards(
                     **result.metrics,
                 })
 
-                # Chain state to next day
+                # Chain state and pending hedges to next day
                 prior_state = result.final_state
+                prior_pending_hedges = result.pending_hedges
 
                 # Explicit cleanup to release memory between shards
                 del client_trades

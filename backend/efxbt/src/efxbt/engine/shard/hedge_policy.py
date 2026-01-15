@@ -1,234 +1,220 @@
-"""Hedge policy interface and implementations.
+"""Rule-based hedge policy implementation.
 
-Provides pluggable hedge policies for different risk management strategies.
-Each policy evaluates current state and market conditions to decide when
-and how to hedge.
+This module implements the rule-based hedging policy that evaluates
+hedging rules with priority-based matching to determine when and
+how to hedge positions.
+
+Priority Resolution:
+1. Specific pair rules (exact match on pair name)
+2. Group rules (pair belongs to a custom group)
+3. "ALL" rules (catch-all)
+
+Within each priority level, first matching rule wins (order matters).
+
+EXTENSIBILITY:
+To add a new action type:
+1. Create a new ActionParams subclass in hedging_config.py
+2. Add it to the ActionParams union type
+3. Implement the action handler in _execute_action() below
 """
 
-from abc import ABC, abstractmethod
+from efxbt.core.config.hedging_config import (
+    AmountType,
+    HedgePercentageParams,
+    HedgeToTargetParams,
+    HedgingRule,
+    HedgingRuleSet,
+    NoHedgeParams,
+)
 
 from .market_fetcher import MarketSnapshot
 from .state import ShardState
 
 
-class HedgePolicy(ABC):
-    """Abstract base class for hedge policies.
+class RuleBasedHedgePolicy:
+    """Rule-based hedge policy with priority matching.
 
-    A hedge policy examines the current position and market conditions,
-    then decides whether to execute hedges and at what quantities.
+    This policy evaluates hedging rules in priority order to determine
+    whether to hedge and how much.
+
+    Priority Resolution:
+    1. Specific pair rules (exact match on pair name)
+    2. Group rules (pair belongs to a custom group)
+    3. "ALL" rules (catch-all)
+
+    Within each priority level, first matching rule wins (order matters).
+
+    Example:
+        >>> rule_set = HedgingRuleSet(
+        ...     groups=[PairGroup(name="G3", pairs=["EURUSD", "USDJPY"])],
+        ...     rules=[
+        ...         HedgingRule(pair_or_group="ALL", from_amount=0, to_amount=1000,
+        ...                     action=NoHedgeParams()),
+        ...         HedgingRule(pair_or_group="ALL", from_amount=1000, to_amount=float('inf'),
+        ...                     action=HedgePercentageParams(hedge_percentage=1.0)),
+        ...     ]
+        ... )
+        >>> policy = RuleBasedHedgePolicy(rule_set)
+        >>> hedges = policy.evaluate(state, market_snapshot, pending_hedges=[])
     """
 
-    @abstractmethod
+    def __init__(self, rule_set: HedgingRuleSet) -> None:
+        """Initialize the policy with a rule set.
+
+        Args:
+            rule_set: Complete hedging configuration with groups and rules
+        """
+        self.rule_set = rule_set
+        # Pre-compute pair -> group mapping for O(1) lookup
+        self._pair_to_group: dict[str, str] = {}
+        for group in rule_set.groups:
+            for pair in group.pairs:
+                self._pair_to_group[pair] = group.name
+
     def evaluate(
         self,
         state: ShardState,
         market_snapshot: MarketSnapshot,
-        config: dict,
+        pending_hedges: list,
     ) -> list[dict]:
-        """Evaluate policy and generate hedge trades.
+        """Evaluate rules and generate hedge trades.
 
         Args:
-            state: Current shard state (position, queue)
-            market_snapshot: Current market conditions
-            config: Policy-specific configuration dict
+            state: Current shard state (position, pair, etc.)
+            market_snapshot: Current market conditions (bid, ask, mid)
+            pending_hedges: List of pending hedge tuples (execute_at, hedge_dict, snapshot).
+                           Used to calculate effective position including in-flight hedges.
+                           Pass empty list [] if no pending hedges.
 
         Returns:
             List of hedge trade dicts. Each dict contains:
             - side: int (+1 buy, -1 sell)
-            - qty: float (hedge quantity)
-            - price: float (execution price, typically bid/ask)
+            - qty: float (hedge quantity in base currency)
+            - price: float (execution price, bid for sells, ask for buys)
             - trade_id: str (unique identifier)
             - timestamp_ms: int (execution timestamp)
 
         Example:
-            >>> policy = AggressiveHedgePolicy()
-            >>> state = ShardState(pair="EURUSD", net_position=1500.0, ...)
-            >>> snapshot = MarketSnapshot(mid=1.10, bid=1.0998, ask=1.1002, ...)
-            >>> config = {"risk_band_qty": 1000.0, "hedge_mode": "full"}
-            >>> hedges = policy.evaluate(state, snapshot, config)
+            >>> hedges = policy.evaluate(state, snapshot, pending_hedges=[])
             >>> hedges
             [{"side": -1, "qty": 1500.0, "price": 1.0998, ...}]
         """
-        pass
+        pair = state.pair
+        position = state.net_position
 
+        # Calculate effective position accounting for pending hedges
+        # This prevents duplicate hedges when policy is evaluated multiple times
+        for _, hedge, _ in pending_hedges:
+            # Hedge side: +1 = buy (adds to position), -1 = sell (reduces position)
+            hedge_effect = hedge["side"] * hedge["qty"]
+            position += hedge_effect
 
-class AggressiveHedgePolicy(HedgePolicy):
-    """Flatten position immediately when outside risk band.
+        # Find first matching rule by priority
+        rule = self._find_matching_rule(pair, position)
+        if rule is None:
+            return []
 
-    This policy monitors the net position and hedges aggressively when
-    it exceeds the configured risk band. Designed for risk-averse desks.
+        # Execute the action
+        hedge_qty = self._execute_action(rule, position)
+        if abs(hedge_qty) < 1e-8:
+            return []
 
-    Configuration:
-        risk_band_qty: float (default: 1000.0)
-            Maximum absolute position before hedging (global default)
-
-        hedge_mode: str (default: "full")
-            - "full": Flatten position completely (hedge entire position)
-            - "partial": Hedge back to risk band edge (hedge excess only)
-
-        pair_bands: dict[str, float] (optional)
-            Per-pair band overrides in base currency units.
-            Example: {"EURUSD": 2000.0, "GBPUSD": 1500.0}
-            Pairs not in this dict use the global risk_band_qty.
-
-    Behavior:
-        - If |position| <= risk_band_qty: No hedge
-        - If |position| > risk_band_qty:
-            - full mode: Hedge entire position (flatten to zero)
-            - partial mode: Hedge (|position| - risk_band_qty) to reach band edge
-
-    Example:
-        >>> policy = AggressiveHedgePolicy()
-        >>> config = {"risk_band_qty": 1000.0, "hedge_mode": "full"}
-        >>> state = ShardState(net_position=1500.0, ...)
-
-        >>> # Outside band (1500 > 1000), hedge triggered
-        >>> hedges = policy.evaluate(state, snapshot, config)
-        >>> hedges[0]["qty"]
-        1500.0  # Full flatten
-
-        >>> config = {"risk_band_qty": 1000.0, "hedge_mode": "partial"}
-        >>> hedges = policy.evaluate(state, snapshot, config)
-        >>> hedges[0]["qty"]
-        500.0  # Partial (1500 - 1000)
-
-        >>> # Per-pair band override
-        >>> config = {"risk_band_qty": 1000.0, "pair_bands": {"EURUSD": 2000.0}}
-        >>> state = ShardState(pair="EURUSD", net_position=1500.0, ...)
-        >>> hedges = policy.evaluate(state, snapshot, config)
-        []  # No hedge, 1500 < 2000 (EURUSD-specific band)
-    """
-
-    def evaluate(
-        self,
-        state: ShardState,
-        market_snapshot: MarketSnapshot,
-        config: dict,
-    ) -> list[dict]:
-        """Evaluate aggressive hedge policy.
-
-        Args:
-            state: Current shard state
-            market_snapshot: Current market snapshot
-            config: Policy config with risk_band_qty, hedge_mode, and optional pair_bands
-
-        Returns:
-            List of hedge trades (empty if no hedge needed)
-        """
-        # Get pair-specific band or fall back to global default
-        pair_bands = config.get("pair_bands", {})
-        global_band = config.get("risk_band_qty", 1000.0)
-        risk_band_qty = pair_bands.get(state.pair, global_band)
-        hedge_mode = config.get("hedge_mode", "full")
-
-        abs_pos = abs(state.net_position)
-
-        # Check if outside band
-        if abs_pos <= risk_band_qty:
-            return []  # No hedge needed
-
-        # Determine hedge side (opposite of position)
-        hedge_side = -1 if state.net_position > 0 else 1
-
-        # Determine hedge quantity
-        if hedge_mode == "full":
-            hedge_qty = abs_pos  # Flatten completely
-        else:  # "partial"
-            hedge_qty = abs_pos - risk_band_qty  # To band edge
-
-        # Select execution price (cross spread)
-        # Buy at ask, sell at bid (realistic execution)
+        # Build hedge trade
+        # Hedge side is opposite of position: long position -> sell, short -> buy
+        hedge_side = -1 if position > 0 else 1
+        # Cross the spread: buy at ask, sell at bid
         hedge_price = market_snapshot.ask if hedge_side == 1 else market_snapshot.bid
 
-        # Generate hedge trade
-        hedge_trade = {
-            "side": hedge_side,
-            "qty": hedge_qty,
-            "price": hedge_price,
-            "trade_id": f"hedge_{state.pair}_{market_snapshot.timestamp_ms}",
-            "timestamp_ms": market_snapshot.timestamp_ms,
-        }
+        return [
+            {
+                "side": hedge_side,
+                "qty": abs(hedge_qty),
+                "price": hedge_price,
+                "trade_id": f"hedge_{pair}_{market_snapshot.timestamp_ms}",
+                "timestamp_ms": market_snapshot.timestamp_ms,
+            }
+        ]
 
-        return [hedge_trade]
-
-
-class PassiveHedgePolicy(HedgePolicy):
-    """Wait and hedge only at advantageous prices.
-
-    This policy is more patient, waiting for favorable market conditions
-    before hedging. Suitable for desks with higher risk tolerance.
-
-    Configuration:
-        risk_band_qty: float (default: 2000.0)
-            Maximum absolute position (higher than aggressive)
-
-        wait_threshold_pct: float (default: 0.5)
-            Wait for this percentage of spread improvement before hedging
-
-    Behavior:
-        - If |position| <= risk_band_qty: No hedge
-        - If |position| > risk_band_qty:
-            - Check if current spread is favorable (< threshold)
-            - If favorable: Hedge back to band edge
-            - If not favorable: Wait (no hedge this cycle)
-
-    Note: This is a future implementation placeholder.
-    """
-
-    def evaluate(
-        self,
-        state: ShardState,
-        market_snapshot: MarketSnapshot,
-        config: dict,
-    ) -> list[dict]:
-        """Evaluate passive hedge policy.
+    def _find_matching_rule(self, pair: str, position: float) -> HedgingRule | None:
+        """Find first matching rule using priority resolution.
 
         Args:
-            state: Current shard state
-            market_snapshot: Current market snapshot
-            config: Policy configuration
+            pair: Currency pair (e.g., "EURUSD")
+            position: Current net position (positive = long, negative = short)
 
         Returns:
-            List of hedge trades (empty if waiting)
-
-        Note:
-            This is a stub for future implementation.
-            Currently raises NotImplementedError.
+            First matching HedgingRule, or None if no rule matches
         """
-        raise NotImplementedError(
-            "PassiveHedgePolicy is not yet implemented. Use AggressiveHedgePolicy."
-        )
+        # Priority 1: Specific pair rules (exact match)
+        for rule in self.rule_set.rules:
+            if rule.pair_or_group == pair and self._position_in_range(position, rule):
+                return rule
 
+        # Priority 2: Group rules (pair belongs to a custom group)
+        group_name = self._pair_to_group.get(pair)
+        if group_name:
+            for rule in self.rule_set.rules:
+                if rule.pair_or_group == group_name and self._position_in_range(
+                    position, rule
+                ):
+                    return rule
 
-# Policy registry for easy lookup
-POLICY_REGISTRY = {
-    "aggressive": AggressiveHedgePolicy,
-    "passive": PassiveHedgePolicy,
-}
+        # Priority 3: "ALL" rules (catch-all)
+        for rule in self.rule_set.rules:
+            if rule.pair_or_group.upper() == "ALL" and self._position_in_range(
+                position, rule
+            ):
+                return rule
 
+        return None
 
-def create_hedge_policy(policy_name: str) -> HedgePolicy:
-    """Factory function to create hedge policy by name.
+    def _position_in_range(self, position: float, rule: HedgingRule) -> bool:
+        """Check if position falls within rule's range.
 
-    Args:
-        policy_name: Name of the policy ("aggressive", "passive", etc.)
+        Args:
+            position: Current net position
+            rule: Hedging rule to check
 
-    Returns:
-        HedgePolicy instance
+        Returns:
+            True if position is within [from_amount, to_amount]
+        """
+        if rule.amount_type == AmountType.ABSOLUTE:
+            value = abs(position)
+        else:  # SIGNED
+            value = position
+        return rule.from_amount <= value <= rule.to_amount
 
-    Raises:
-        ValueError: If policy_name not found in registry
+    def _execute_action(self, rule: HedgingRule, position: float) -> float:
+        """Execute action and return hedge quantity.
 
-    Example:
-        >>> policy = create_hedge_policy("aggressive")
-        >>> isinstance(policy, AggressiveHedgePolicy)
-        True
-    """
-    if policy_name not in POLICY_REGISTRY:
-        raise ValueError(
-            f"Unknown hedge policy: {policy_name}. "
-            f"Available policies: {list(POLICY_REGISTRY.keys())}"
-        )
+        Args:
+            rule: Matched hedging rule
+            position: Current net position
 
-    policy_class = POLICY_REGISTRY[policy_name]
-    return policy_class()
+        Returns:
+            Hedge quantity (0 for no-hedge actions, positive for hedge actions)
+
+        Raises:
+            ValueError: If action type is unknown
+        """
+        action = rule.action
+        abs_pos = abs(position)
+
+        # === EXTENSIBILITY POINT ===
+        # Add new action handlers here
+
+        if isinstance(action, NoHedgeParams):
+            return 0.0
+
+        elif isinstance(action, HedgeToTargetParams):
+            # Target = from_amount * target_percentage
+            # Hedge down to target level
+            target = rule.from_amount * action.target_percentage
+            return max(0.0, abs_pos - target)
+
+        elif isinstance(action, HedgePercentageParams):
+            # Hedge this percentage of current position
+            return abs_pos * action.hedge_percentage
+
+        # Unknown action type - should not happen with proper type checking
+        raise ValueError(f"Unknown action type: {type(action)}")

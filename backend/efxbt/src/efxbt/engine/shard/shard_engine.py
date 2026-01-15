@@ -5,6 +5,7 @@ hedge policies) into a cohesive simulation loop with full trade-level attributio
 multi-currency PnL tracking.
 """
 
+import heapq
 from pathlib import Path
 
 import numpy as np
@@ -14,8 +15,8 @@ from ...core.config.run_config import SimulationConfig
 from ...core.data.schemas import DecrossedTradeRecord
 from .fifo_matcher import FIFO_SLICE_DTYPE, FIFOMatcher
 from .fx_converter import FXConverter
-from .hedge_policy import create_hedge_policy
-from .market_fetcher import MarketSnapshotFetcher
+from .hedge_policy import RuleBasedHedgePolicy
+from .market_fetcher import MarketSnapshot, MarketSnapshotFetcher
 from .pnl_calculator import PnLCalculator, calculate_hedge_cost
 from .state import FIFOSlice, PnLAttributionRecord, ShardState, TradePnLAttribution
 from .state_internal import (
@@ -23,7 +24,7 @@ from .state_internal import (
     PnLAttributionRecordInternal,
     convert_records_to_pydantic,
 )
-from .timeline import build_timeline
+from .timeline import build_timeline, TimelinePoint
 
 
 class ShardResult(BaseModel):
@@ -38,6 +39,7 @@ class ShardResult(BaseModel):
         pnl_records: List of PnL attribution records (one per event)
         metrics: Summary metrics dict
         fifo_queue_numpy: Raw numpy FIFO queue for efficient chaining (avoids Pydantic conversion)
+        pending_hedges: Pending hedges to chain to next day (execute_at_ms, hedge_dict, snapshot_dict)
     """
 
     model_config = {"arbitrary_types_allowed": True}
@@ -48,6 +50,7 @@ class ShardResult(BaseModel):
     pnl_records: list[PnLAttributionRecord]
     metrics: dict
     fifo_queue_numpy: np.ndarray | None = None  # For efficient state chaining
+    pending_hedges: list[tuple[int, dict, dict]] | None = None  # (execute_at, hedge, snapshot)
 
 
 class ShardEngine:
@@ -87,16 +90,21 @@ class ShardEngine:
         self.fifo_matcher = FIFOMatcher()
         self.fx_converter = FXConverter(config.reporting_currency)
         self.pnl_calculator = PnLCalculator(self.fx_converter)
-        self.hedge_policy = create_hedge_policy(config.hedge_policy)
+        self.hedge_policy = RuleBasedHedgePolicy(config.hedging_rules)
 
         # Get native currency for this pair
         self.native_currency = self.fx_converter.get_native_currency(pair)
+
+        # Deferred hedge queue: list of (execute_at_ms, hedge_trade, trigger_snapshot) tuples
+        # Snapshot is captured at trigger time to ensure we never use future market data
+        self._pending_hedges: list[tuple[int, dict, MarketSnapshot]] = []
 
     def run(
         self,
         client_trades: list[DecrossedTradeRecord],
         prior_state: ShardState | None = None,
         prior_queue_numpy: np.ndarray | None = None,
+        prior_pending_hedges: list[tuple[int, dict, dict]] | None = None,
     ) -> ShardResult:
         """Run simulation for this shard.
 
@@ -104,6 +112,7 @@ class ShardEngine:
             client_trades: List of client trades to simulate
             prior_state: Prior day's final state (for state chaining)
             prior_queue_numpy: Raw numpy FIFO queue (faster than converting from Pydantic)
+            prior_pending_hedges: Pending hedges from prior day (execute_at, hedge, snapshot_dict)
 
         Returns:
             ShardResult with final state, PnL records, and metrics
@@ -123,8 +132,8 @@ class ShardEngine:
         timeline = build_timeline(client_trades, self.config)
 
         if not timeline:
-            # No events to process
-            return self._empty_result(prior_state, prior_queue_numpy)
+            # No events to process - pass through pending hedges for next day
+            return self._empty_result(prior_state, prior_queue_numpy, prior_pending_hedges)
 
         # Step 2: Fetch ALL market snapshots (single DuckDB query)
         snapshots = self.market_fetcher.fetch_snapshots(timeline)
@@ -158,9 +167,244 @@ class ShardEngine:
         recent_trades: dict[str, DecrossedTradeRecord] = {}  # Track for hedge attribution (O(1) lookup)
         recent_trades_list: list[DecrossedTradeRecord] = []  # Maintained alongside dict to avoid O(n) conversion
 
-        for point in timeline:
-            snapshot = snapshots[point.timestamp_ms]
+        # Convert timeline to heap for dynamic hedge execution point insertion
+        # Priority order: (timestamp, event_priority) where priority ensures correct ordering
+        # client_fill=0, hedge_fill=1, sample=2
+        event_priority = {"client_fill": 0, "hedge_fill": 1, "sample": 2}
+        timeline_heap: list[tuple[int, int, int, TimelinePoint]] = []
+        for idx, point in enumerate(timeline):
+            priority = event_priority.get(point.event_type, 2)
+            # Heap tuple: (timestamp, priority, insertion_order, point)
+            # insertion_order ensures stable sorting for same (timestamp, priority)
+            heapq.heappush(timeline_heap, (point.timestamp_ms, priority, idx, point))
+
+        # Track last snapshot for forward-fill when processing dynamically added points
+        last_snapshot = None
+        hedge_point_counter = len(timeline)  # Start after existing points for stable ordering
+
+        # Restore pending hedges from prior day (if any) - add to both heap and _pending_hedges
+        if prior_pending_hedges:
+            # Convert snapshot dicts back to MarketSnapshot objects
+            for execute_at, hedge, snapshot_dict in prior_pending_hedges:
+                trigger_snapshot = MarketSnapshot(**snapshot_dict)
+                self._pending_hedges.append((execute_at, hedge, trigger_snapshot))
+
+                hedge_point = TimelinePoint(
+                    timestamp_ms=execute_at,
+                    event_type="hedge_fill",
+                    hedge_trade=hedge,
+                )
+                heapq.heappush(
+                    timeline_heap,
+                    (execute_at, 1, hedge_point_counter, hedge_point)
+                )
+                hedge_point_counter += 1
+
+        # Helper function to execute a hedge (reused for immediate and deferred hedges)
+        def execute_hedge(
+            hedge: dict,
+            snapshot,
+            event_attributions: list[TradePnLAttributionInternal],
+        ) -> None:
+            """Execute a single hedge trade and create attributions.
+
+            PnL Model for Hedges:
+            - execution_pnl: Same formula as client trades (fill_price - mid) * qty * (-side)
+                            For hedges crossing the spread, this is negative (we pay spread)
+            - inventory_pnl: Always 0 (hedges close positions immediately, not held)
+            - hedge_pnl: Equals -execution_pnl, so hedge trade total = 0
+                        This cost is then attributed to the source trades that opened the risk
+            """
+            # Calculate execution PnL for hedge (same formula as client trades)
+            # Hedge crosses spread: buy at ask (above mid) or sell at bid (below mid)
+            # This will be negative (cost of crossing spread)
+            exec_pnl_native, exec_pnl_reporting = self.pnl_calculator.calculate_execution_pnl(
+                hedge["price"],  # Actual execution price (bid or ask)
+                snapshot.mid,
+                hedge["qty"],
+                hedge["side"],
+                self.pair,
+                snapshot.fx_rate,
+            )
+
+            # Hedge PnL = -execution_pnl (so hedge trade total = 0)
+            # This represents the cost that will be attributed to source trades
+            hedge_pnl_native = -exec_pnl_native
+            hedge_pnl_reporting = -exec_pnl_reporting
+
+            # FIFO match for hedge - closes positions opened by source trades
+            match_result_hedge = self.fifo_matcher.process_fill(
+                hedge, snapshot, is_hedge=True
+            )
+
+            # Build hedge cost allocation per matched source trade (proportional to matched qty)
+            # The hedge cost is attributed to the trades it matches on the risk queue
+            total_matched_qty = sum(qty for _, qty, _ in match_result_hedge.matched_slices)
+            hedge_cost_by_trade: dict[str, tuple[float, float]] = {}
+
+            if total_matched_qty > 0:
+                for slice_id, matched_qty, _ in match_result_hedge.matched_slices:
+                    pct = matched_qty / total_matched_qty
+                    alloc_native = hedge_pnl_native * pct
+                    alloc_reporting = hedge_pnl_reporting * pct
+
+                    if slice_id in hedge_cost_by_trade:
+                        old_native, old_reporting = hedge_cost_by_trade[slice_id]
+                        hedge_cost_by_trade[slice_id] = (
+                            old_native + alloc_native,
+                            old_reporting + alloc_reporting,
+                        )
+                    else:
+                        hedge_cost_by_trade[slice_id] = (alloc_native, alloc_reporting)
+
+            # Update net position
+            state.net_position += hedge["qty"] * hedge["side"]
+            hedge_trades.append(hedge)
+
+            # Create single hedge_fill attribution record for the hedge trade itself
+            # execution_pnl + inventory_pnl(0) + hedge_pnl(-exec) = 0
+            hedge_trade_attribution = TradePnLAttributionInternal(
+                timestamp_ms=hedge["timestamp_ms"],
+                event_type="hedge_fill",
+                source_trade_id=hedge["trade_id"],
+                pair=self.pair,
+                side=hedge["side"],
+                qty=hedge["qty"],
+                price=hedge["price"],
+                native_currency=self.native_currency,
+                reporting_currency=self.config.reporting_currency,
+                fx_rate=snapshot.fx_rate,
+                metadata=(0, False, []),  # Hedge trades don't have order metadata
+                execution_pnl_native=exec_pnl_native,
+                execution_pnl_reporting=exec_pnl_reporting,
+                inventory_pnl_native=0.0,  # Hedges don't hold inventory
+                inventory_pnl_reporting=0.0,
+                hedge_pnl_native=hedge_pnl_native,  # -exec_pnl so total = 0
+                hedge_pnl_reporting=hedge_pnl_reporting,
+                triggered_hedge=True,
+                net_position=state.net_position,
+            )
+            event_attributions.append(hedge_trade_attribution)
+
+            # Attribute inventory_pnl and hedge_cost to source trades that were matched
+            # matched_slices: [(source_trade_id, matched_qty, inventory_pnl_native), ...]
+            for slice_id, matched_qty, inv_pnl_native in match_result_hedge.matched_slices:
+                source_trade = recent_trades.get(slice_id)
+                if source_trade:
+                    # Get hedge cost allocation for this trade
+                    hedge_alloc_native, hedge_alloc_reporting = hedge_cost_by_trade.get(
+                        slice_id, (0.0, 0.0)
+                    )
+
+                    # Convert inventory PnL to reporting currency
+                    inv_pnl_reporting = self.pnl_calculator.convert_inventory_pnl(
+                        inv_pnl_native, self.pair, snapshot.fx_rate
+                    )
+
+                    # Attribution for inventory PnL (position was held and now closed)
+                    inv_attribution = TradePnLAttributionInternal(
+                        timestamp_ms=hedge["timestamp_ms"],
+                        event_type="inventory_close",
+                        source_trade_id=slice_id,
+                        pair=self.pair,
+                        side=0,  # Attribution event, not a trade
+                        qty=matched_qty,
+                        price=snapshot.mid,
+                        native_currency=self.native_currency,
+                        reporting_currency=self.config.reporting_currency,
+                        fx_rate=snapshot.fx_rate,
+                        metadata=(source_trade.order_id, source_trade.is_direct, source_trade.path),
+                        execution_pnl_native=0.0,
+                        execution_pnl_reporting=0.0,
+                        inventory_pnl_native=inv_pnl_native,
+                        inventory_pnl_reporting=inv_pnl_reporting,
+                        hedge_pnl_native=0.0,
+                        hedge_pnl_reporting=0.0,
+                        net_position=state.net_position,
+                    )
+                    event_attributions.append(inv_attribution)
+
+                    # Attribution for hedge cost (negative, it's a cost to the source trade)
+                    # hedge_alloc is positive (offset on hedge), so negate for source trade
+                    cost_attribution = TradePnLAttributionInternal(
+                        timestamp_ms=hedge["timestamp_ms"],
+                        event_type="hedge_cost",
+                        source_trade_id=slice_id,
+                        pair=self.pair,
+                        side=0,  # Attribution, not a trade
+                        qty=0.0,
+                        price=snapshot.mid,
+                        native_currency=self.native_currency,
+                        reporting_currency=self.config.reporting_currency,
+                        fx_rate=snapshot.fx_rate,
+                        metadata=(source_trade.order_id, source_trade.is_direct, source_trade.path),
+                        execution_pnl_native=0.0,
+                        execution_pnl_reporting=0.0,
+                        inventory_pnl_native=0.0,
+                        inventory_pnl_reporting=0.0,
+                        hedge_pnl_native=-hedge_alloc_native,  # Cost to source trade (negative)
+                        hedge_pnl_reporting=-hedge_alloc_reporting,
+                        net_position=state.net_position,
+                    )
+                    event_attributions.append(cost_attribution)
+
+        while timeline_heap:
+            _, _, idx, point = heapq.heappop(timeline_heap)
             event_attributions: list[TradePnLAttributionInternal] = []
+
+            # Process hedge_fill events - use the captured snapshot from trigger time
+            if point.event_type == "hedge_fill" and point.hedge_trade is not None:
+                hedge = point.hedge_trade
+                hedge["timestamp_ms"] = point.timestamp_ms
+
+                # Find the matching pending hedge to get the captured trigger snapshot
+                # Compare by trade_id since Pydantic may copy the dict
+                captured_snapshot = None
+                hedge_trade_id = hedge.get("trade_id")
+                for i, (exec_at, h, snap) in enumerate(self._pending_hedges):
+                    if exec_at == point.timestamp_ms and h.get("trade_id") == hedge_trade_id:
+                        captured_snapshot = snap
+                        # Remove from pending list
+                        self._pending_hedges.pop(i)
+                        break
+
+                if captured_snapshot is not None:
+                    execute_hedge(hedge, captured_snapshot, event_attributions)
+                else:
+                    # Fallback: shouldn't happen, but use current snapshot if available
+                    if point.timestamp_ms in snapshots:
+                        execute_hedge(hedge, snapshots[point.timestamp_ms], event_attributions)
+
+                # Record attributions and continue to next event
+                if event_attributions:
+                    # Calculate totals
+                    total_exec = total_inv = total_hedge = total_unreal = 0.0
+                    for attr in event_attributions:
+                        total_exec += attr.execution_pnl_reporting
+                        total_inv += attr.inventory_pnl_reporting
+                        total_hedge += attr.hedge_pnl_reporting
+                        total_unreal += attr.unrealized_pnl_reporting
+
+                    pnl_record = PnLAttributionRecordInternal(
+                        timestamp_ms=point.timestamp_ms,
+                        event_type="hedge_fill",
+                        trade_attributions=event_attributions,
+                        total_execution_pnl_reporting=total_exec,
+                        total_inventory_pnl_reporting=total_inv,
+                        total_hedge_pnl_reporting=total_hedge,
+                        total_unrealized_pnl_reporting=total_unreal,
+                    )
+                    pnl_records_internal.append(pnl_record)
+                continue
+
+            # Get snapshot for client_fill and sample events
+            if point.timestamp_ms in snapshots:
+                snapshot = snapshots[point.timestamp_ms]
+                last_snapshot = snapshot  # Update last known snapshot
+            elif last_snapshot is not None:
+                snapshot = last_snapshot
+            else:
+                raise ValueError(f"No snapshot available for timestamp {point.timestamp_ms}")
 
             # Process client fill
             if point.event_type == "client_fill":
@@ -181,138 +425,90 @@ class ShardEngine:
                 # FIFO match with attribution
                 match_result = self.fifo_matcher.process_fill(trade, snapshot, is_hedge=False)
 
-                # Convert inventory PnL to reporting currency
-                inv_pnl_native = match_result.inventory_pnl
-                inv_pnl_reporting = self.pnl_calculator.convert_inventory_pnl(
-                    inv_pnl_native, self.pair, snapshot.fx_rate
-                )
-
-                # Create attribution record for this trade
-                # Use tuples instead of dicts for hot path efficiency
-                # Side is already from house's perspective (house BUY = +1, house SELL = -1)
-                trade_attribution = TradePnLAttributionInternal(
-                    timestamp_ms=trade.timestamp_ms,
-                    event_type="client_fill",
-                    source_trade_id=trade.source_trade_id,
-                    pair=trade.pair,
-                    side=trade.side,  # Already house's perspective
-                    qty=trade.qty,
-                    price=snapshot.mid,
-                    native_currency=self.native_currency,
-                    reporting_currency=self.config.reporting_currency,
-                    fx_rate=snapshot.fx_rate,
-                    metadata=(trade.order_id, trade.is_direct, trade.path),  # Tuple: more efficient than dict
-                    execution_pnl_native=exec_pnl_native,
-                    execution_pnl_reporting=exec_pnl_reporting,
-                    inventory_pnl_native=inv_pnl_native,
-                    inventory_pnl_reporting=inv_pnl_reporting,
-                    matched_slices=match_result.matched_slices,  # Already list of tuples from FIFO matcher
-                )
-                event_attributions.append(trade_attribution)
-
                 # Update net position (side is already from house's perspective)
                 # +1 = house BUYS → position increases
                 # -1 = house SELLS → position decreases
                 state.net_position += trade.qty * trade.side
 
-            # Evaluate hedge policy
-            hedge_trades_now = self.hedge_policy.evaluate(
-                state, snapshot, self.config.hedge_policy_config
-            )
-
-            for hedge in hedge_trades_now:
-                # Calculate hedge cost (in native currency)
-                hedge_cost_native = calculate_hedge_cost(
-                    hedge["side"], hedge["qty"], snapshot.spread
+                # Create attribution record for the incoming trade
+                # inventory_pnl = 0 for the incoming trade (it hasn't been held yet)
+                # Inventory PnL is attributed to the SOURCE trades that were closed
+                trade_attribution = TradePnLAttributionInternal(
+                    timestamp_ms=trade.timestamp_ms,
+                    event_type="client_fill",
+                    source_trade_id=trade.source_trade_id,
+                    pair=trade.pair,
+                    side=trade.side,
+                    qty=trade.qty,
+                    price=snapshot.mid,
+                    native_currency=self.native_currency,
+                    reporting_currency=self.config.reporting_currency,
+                    fx_rate=snapshot.fx_rate,
+                    metadata=(trade.order_id, trade.is_direct, trade.path),
+                    execution_pnl_native=exec_pnl_native,
+                    execution_pnl_reporting=exec_pnl_reporting,
+                    inventory_pnl_native=0.0,  # Incoming trade has no inventory PnL
+                    inventory_pnl_reporting=0.0,
+                    matched_slices=match_result.matched_slices,
+                    net_position=state.net_position,
                 )
+                event_attributions.append(trade_attribution)
 
-                # Convert hedge cost to reporting currency
-                hedge_cost_reporting = self.pnl_calculator.convert_inventory_pnl(
-                    hedge_cost_native, self.pair, snapshot.fx_rate
-                )
-
-                # Attribute hedge cost to trades that triggered it
-                hedge_allocations = self.pnl_calculator.attribute_hedge_cost_to_trades(
-                    hedge_cost_native,
-                    hedge_cost_reporting,
-                    recent_trades_list,  # Use pre-built list (O(1) vs O(n) conversion)
-                    state.net_position,
-                )
-
-                # FIFO match for hedge
-                match_result_hedge = self.fifo_matcher.process_fill(
-                    hedge, snapshot, is_hedge=True
-                )
-
-                # Convert hedge inventory PnL
-                inv_pnl_hedge_native = match_result_hedge.inventory_pnl
-                inv_pnl_hedge_reporting = self.pnl_calculator.convert_inventory_pnl(
-                    inv_pnl_hedge_native, self.pair, snapshot.fx_rate
-                )
-
-                # Create attribution records for each trade that triggered hedge
-                for trade_id, (alloc_native, alloc_reporting) in hedge_allocations.items():
-                    source_trade = recent_trades.get(trade_id)
-                    if source_trade:
-                        hedge_attribution = TradePnLAttributionInternal(
-                            timestamp_ms=hedge["timestamp_ms"],
-                            event_type="hedge_fill",
-                            source_trade_id=trade_id,
-                            pair=self.pair,
-                            side=hedge["side"],
-                            qty=hedge["qty"],
-                            price=snapshot.mid,
-                            native_currency=self.native_currency,
-                            reporting_currency=self.config.reporting_currency,
-                            fx_rate=snapshot.fx_rate,
-                            metadata=(source_trade.order_id, source_trade.is_direct, source_trade.path),  # Tuple
-                            execution_pnl_native=0.0,
-                            execution_pnl_reporting=0.0,
-                            inventory_pnl_native=0.0,
-                            inventory_pnl_reporting=0.0,
-                            hedge_pnl_native=alloc_native,
-                            hedge_pnl_reporting=alloc_reporting,
-                            triggered_hedge=True,
-                            hedge_allocation_pct=(
-                                alloc_native / hedge_cost_native
-                                if hedge_cost_native != 0 else 0
-                            ),
-                        )
-                        event_attributions.append(hedge_attribution)
-
-                # Attribute inventory PnL from hedge matching to source trades
-                for slice_id, matched_qty, pnl_native in match_result_hedge.matched_slices:
+                # Attribute inventory PnL to the SOURCE trades that were held and now closed
+                # matched_slices: [(source_trade_id, matched_qty, inventory_pnl_native), ...]
+                for slice_id, matched_qty, inv_pnl_native in match_result.matched_slices:
                     source_trade = recent_trades.get(slice_id)
                     if source_trade:
-                        pnl_reporting = self.pnl_calculator.convert_inventory_pnl(
-                            pnl_native, self.pair, snapshot.fx_rate
+                        inv_pnl_reporting = self.pnl_calculator.convert_inventory_pnl(
+                            inv_pnl_native, self.pair, snapshot.fx_rate
                         )
-
                         inv_attribution = TradePnLAttributionInternal(
-                            timestamp_ms=hedge["timestamp_ms"],
-                            event_type="hedge_match",
+                            timestamp_ms=trade.timestamp_ms,
+                            event_type="inventory_close",
                             source_trade_id=slice_id,
                             pair=self.pair,
-                            side=0,  # Matched event, no side change
+                            side=0,  # Attribution event, not a trade
                             qty=matched_qty,
                             price=snapshot.mid,
                             native_currency=self.native_currency,
                             reporting_currency=self.config.reporting_currency,
                             fx_rate=snapshot.fx_rate,
-                            metadata=(source_trade.order_id, source_trade.is_direct, source_trade.path),  # Tuple
+                            metadata=(source_trade.order_id, source_trade.is_direct, source_trade.path),
                             execution_pnl_native=0.0,
                             execution_pnl_reporting=0.0,
-                            inventory_pnl_native=pnl_native,
-                            inventory_pnl_reporting=pnl_reporting,
+                            inventory_pnl_native=inv_pnl_native,
+                            inventory_pnl_reporting=inv_pnl_reporting,
                             hedge_pnl_native=0.0,
                             hedge_pnl_reporting=0.0,
-                            matched_slices=[(slice_id, matched_qty, pnl_native)],  # Tuple instead of dict
+                            net_position=state.net_position,
                         )
                         event_attributions.append(inv_attribution)
 
-                # Update net position
-                state.net_position += hedge["qty"] * hedge["side"]
-                hedge_trades.append(hedge)
+            # Evaluate hedge policy (pass pending hedges to calculate effective position)
+            hedge_trades_now = self.hedge_policy.evaluate(
+                state, snapshot, pending_hedges=self._pending_hedges
+            )
+
+            for hedge in hedge_trades_now:
+                if self.config.hedge_delay_ms > 0:
+                    # Queue hedge for deferred execution by adding to timeline heap
+                    execute_at = point.timestamp_ms + self.config.hedge_delay_ms
+                    hedge_point = TimelinePoint(
+                        timestamp_ms=execute_at,
+                        event_type="hedge_fill",
+                        hedge_trade=hedge,
+                    )
+                    # Push onto heap with hedge_fill priority (1)
+                    heapq.heappush(
+                        timeline_heap,
+                        (execute_at, 1, hedge_point_counter, hedge_point)
+                    )
+                    hedge_point_counter += 1
+                    # Store with captured snapshot from trigger time (never use future data)
+                    self._pending_hedges.append((execute_at, hedge, snapshot))
+                else:
+                    # Execute immediately
+                    execute_hedge(hedge, snapshot, event_attributions)
 
             # Sample unrealized PnL with per-slice attribution
             # Skip processing if position is flat (no open slices)
@@ -346,6 +542,7 @@ class ShardEngine:
                             hedge_pnl_reporting=0.0,
                             unrealized_pnl_native=unrealized_native,
                             unrealized_pnl_reporting=unrealized_reporting,
+                            net_position=state.net_position,  # Current position at sample time
                         )
                         event_attributions.append(sample_attribution)
 
@@ -397,6 +594,14 @@ class ShardEngine:
         # Step 9: Calculate metrics
         metrics = self._calculate_metrics(pnl_records, state, client_trades, hedge_trades)
 
+        # Return pending hedges for chaining to next day (serialize snapshots as dicts)
+        remaining_pending_hedges: list[tuple[int, dict, dict]] | None = None
+        if self._pending_hedges:
+            remaining_pending_hedges = [
+                (exec_at, hedge, snap.model_dump())
+                for exec_at, hedge, snap in self._pending_hedges
+            ]
+
         return ShardResult(
             pair=self.pair,
             date=self.date,
@@ -404,6 +609,7 @@ class ShardEngine:
             pnl_records=pnl_records,
             metrics=metrics,
             fifo_queue_numpy=final_queue_numpy,  # For efficient state chaining
+            pending_hedges=remaining_pending_hedges,  # For hedge delay across days
         )
 
     def _state_to_numpy(self, fifo_queue: list[FIFOSlice]) -> np.ndarray:
@@ -507,7 +713,7 @@ class ShardEngine:
         return {
             # Volume metrics
             "total_client_volume": total_client_volume,
-            "total_hedge_volume": total_hedge_volume,
+            "externalized_volume": total_hedge_volume,
             "internalized_volume": internalized_volume,
             "internalization_ratio": internalization_ratio,
             # PnL metrics (reporting currency)
@@ -530,12 +736,14 @@ class ShardEngine:
         self,
         prior_state: ShardState | None,
         prior_queue_numpy: np.ndarray | None = None,
+        prior_pending_hedges: list[tuple[int, dict]] | None = None,
     ) -> ShardResult:
         """Create empty result when no trades to process.
 
         Args:
             prior_state: Prior state (if any)
             prior_queue_numpy: Raw numpy FIFO queue (for efficient chaining)
+            prior_pending_hedges: Pending hedges from prior day (pass through)
 
         Returns:
             Empty ShardResult
@@ -564,4 +772,5 @@ class ShardEngine:
                 "hedge_trade_count": 0,
             },
             fifo_queue_numpy=prior_queue_numpy,  # Pass through for chaining
+            pending_hedges=prior_pending_hedges,  # Pass through for chaining
         )

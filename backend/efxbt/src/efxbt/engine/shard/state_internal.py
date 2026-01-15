@@ -46,6 +46,7 @@ class TradePnLAttributionInternal:
     matched_slices: list | None = None
     triggered_hedge: bool = False
     hedge_allocation_pct: float = 0.0
+    net_position: float = 0.0  # Position after this event
 
 
 @dataclass(slots=True)
@@ -113,6 +114,7 @@ def to_pydantic_attribution(attr: TradePnLAttributionInternal):
         matched_slices=matched_slices_dicts,
         triggered_hedge=attr.triggered_hedge,
         hedge_allocation_pct=attr.hedge_allocation_pct,
+        net_position=attr.net_position,
     )
 
 

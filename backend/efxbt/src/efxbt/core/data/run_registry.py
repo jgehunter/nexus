@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -412,6 +412,12 @@ class RunRegistry:
                 if status is None or record.status == status:
                     runs.append(record)
             except (RunNotFoundError, json.JSONDecodeError):
+                continue
+            except ValidationError as e:
+                # Skip runs with incompatible config format (e.g., old hedging config)
+                logger.warning(
+                    f"Skipping run {run_dir.name} due to incompatible config format: {e}"
+                )
                 continue
 
         # Sort by created_at_ms descending (newest first)

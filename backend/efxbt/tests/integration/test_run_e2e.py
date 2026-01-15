@@ -176,10 +176,24 @@ class TestRunE2E:
             "simulation_config": {
                 "dataset": e2e_environment["dataset_name"],
                 "reporting_currency": "USD",
-                "hedge_policy": "aggressive",
-                "hedge_policy_config": {
-                    "risk_band_qty": 10000.0,
-                    "hedge_mode": "full",
+                "hedging_rules": {
+                    "groups": [],
+                    "rules": [
+                        {
+                            "pair_or_group": "ALL",
+                            "amount_type": "absolute",
+                            "from_amount": 0,
+                            "to_amount": 10000.0,
+                            "action": {"action_type": "no_hedge"},
+                        },
+                        {
+                            "pair_or_group": "ALL",
+                            "amount_type": "absolute",
+                            "from_amount": 10000.0,
+                            "to_amount": 1e18,
+                            "action": {"action_type": "hedge_percentage", "hedge_percentage": 1.0},
+                        },
+                    ],
                 },
                 "sample_interval_seconds": 30,
             },
@@ -294,8 +308,13 @@ class TestRunE2E:
             "simulation_config": {
                 "dataset": e2e_environment["dataset_name"],
                 "reporting_currency": "USD",
-                "hedge_policy": "aggressive",
-                "hedge_policy_config": {"risk_band_qty": 10000.0, "hedge_mode": "full"},
+                "hedging_rules": {
+                    "groups": [],
+                    "rules": [
+                        {"pair_or_group": "ALL", "amount_type": "absolute", "from_amount": 0, "to_amount": 10000.0, "action": {"action_type": "no_hedge"}},
+                        {"pair_or_group": "ALL", "amount_type": "absolute", "from_amount": 10000.0, "to_amount": 1e18, "action": {"action_type": "hedge_percentage", "hedge_percentage": 1.0}},
+                    ],
+                },
                 "sample_interval_seconds": 30,
             },
             "general_config": {

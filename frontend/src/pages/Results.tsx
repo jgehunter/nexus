@@ -275,7 +275,12 @@ export function Results() {
               )}
 
               {activeTab === 'operations' && (
-                <OpsPanel metrics={summary.ops_metrics} definitions={kpiDefinitions} />
+                <OpsPanel
+                  metrics={summary.ops_metrics}
+                  definitions={kpiDefinitions}
+                  runId={selectedRunId!}
+                  pairs={summary.pairs}
+                />
               )}
             </div>
           </div>

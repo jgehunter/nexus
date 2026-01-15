@@ -670,6 +670,7 @@ class RunService:
         limit: int = 100,
         offset: int = 0,
         pair: str | None = None,
+        event_type: str | None = None,
     ) -> tuple[list[TradeRecord], int]:
         """Get paginated trade-level data.
 
@@ -678,6 +679,7 @@ class RunService:
             limit: Maximum trades to return
             offset: Pagination offset
             pair: Optional filter by currency pair
+            event_type: Optional filter by event type ('client_fill' or 'hedge_fill')
 
         Returns:
             Tuple of (trade records, total count)
@@ -703,22 +705,33 @@ class RunService:
         try:
             import duckdb
 
-            # Build WHERE clause for pair filter
-            where_clause = f"WHERE pair = '{pair}'" if pair else ""
+            # Build WHERE clause for filters
+            # Exclude internal attribution events - only show actual trades
+            conditions = ["event_type IN ('client_fill', 'hedge_fill')"]
+            if pair:
+                conditions.append(f"pair = '{pair}'")
+            if event_type:
+                conditions.append(f"event_type = '{event_type}'")
+            where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
 
             # Use context manager for proper connection cleanup
             with duckdb.connect(":memory:") as conn:
-                # Count total rows
+                # Count unique trades (not attribution rows)
+                # Group by trade identifiers to get unique trades
                 count_query = f"""
-                SELECT COUNT(*) FROM read_parquet('{pnl_path}')
-                {where_clause}
+                SELECT COUNT(*) FROM (
+                    SELECT DISTINCT timestamp_ms, pair, event_type, side, qty, price
+                    FROM read_parquet('{pnl_path}')
+                    {where_clause}
+                )
                 """
                 total = conn.execute(count_query).fetchone()[0]
 
                 if total == 0:
                     return [], 0
 
-                # Query for paginated trades
+                # Query for paginated trades - group by unique trade to aggregate PnL
+                # Each trade may have multiple attribution rows (attributed to different source trades)
                 query = f"""
                 SELECT
                     timestamp_ms,
@@ -727,12 +740,13 @@ class RunService:
                     side,
                     qty,
                     price,
-                    COALESCE(execution_pnl_reporting, execution_pnl, 0) as execution_pnl,
-                    COALESCE(inventory_pnl_reporting, inventory_pnl, 0) as inventory_pnl,
-                    COALESCE(hedge_pnl_reporting, hedge_pnl, 0) as hedge_pnl,
-                    source_trade_id
+                    SUM(COALESCE(execution_pnl_reporting, 0)) as execution_pnl,
+                    SUM(COALESCE(inventory_pnl_reporting, 0)) as inventory_pnl,
+                    SUM(COALESCE(hedge_pnl_reporting, 0)) as hedge_pnl,
+                    MIN(source_trade_id) as source_trade_id
                 FROM read_parquet('{pnl_path}')
                 {where_clause}
+                GROUP BY timestamp_ms, pair, event_type, side, qty, price
                 ORDER BY timestamp_ms
                 LIMIT {limit} OFFSET {offset}
                 """

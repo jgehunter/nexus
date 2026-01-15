@@ -131,6 +131,7 @@ class StreamingPnLWriter:
             "unrealized_pnl_reporting": trade_attr.unrealized_pnl_reporting,
             "triggered_hedge": trade_attr.triggered_hedge,
             "hedge_allocation_pct": trade_attr.hedge_allocation_pct,
+            "net_position": trade_attr.net_position,
             # Metadata fields (extensible)
             "order_id": trade_attr.metadata.get("order_id"),
             "is_direct": trade_attr.metadata.get("is_direct"),
@@ -222,6 +223,7 @@ class StreamingPnLWriter:
             "unrealized_pnl_reporting": pa.array([], type=pa.float64()),
             "triggered_hedge": pa.array([], type=pa.bool_()),
             "hedge_allocation_pct": pa.array([], type=pa.float64()),
+            "net_position": pa.array([], type=pa.float64()),
             "order_id": pa.array([], type=pa.string()),
             "is_direct": pa.array([], type=pa.bool_()),
             "path": pa.array([], type=pa.string()),

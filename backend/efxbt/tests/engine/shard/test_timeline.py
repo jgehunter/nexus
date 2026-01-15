@@ -6,8 +6,24 @@ Tests timeline building, event merging, and priority ordering.
 import pytest
 
 from efxbt.core.config.run_config import SimulationConfig
+from efxbt.core.config.hedging_config import HedgingRuleSet, HedgingRule, NoHedgeParams
 from efxbt.core.data.schemas import DecrossedTradeRecord
 from efxbt.engine.shard.timeline import TimelinePoint, build_timeline
+
+
+# Default hedging rules for tests (simple no-hedge rule)
+DEFAULT_TEST_HEDGING_RULES = HedgingRuleSet(
+    groups=[],
+    rules=[
+        HedgingRule(
+            pair_or_group="ALL",
+            amount_type="absolute",
+            from_amount=0,
+            to_amount=float("inf"),
+            action=NoHedgeParams(),
+        )
+    ],
+)
 
 
 def create_test_trade(
@@ -50,6 +66,7 @@ class TestBuildTimeline:
             dataset="btec",
             reporting_currency="USD",
             sample_interval_seconds=60,
+            hedging_rules=DEFAULT_TEST_HEDGING_RULES,
         )
 
         timeline = build_timeline(trades, config)
@@ -71,6 +88,7 @@ class TestBuildTimeline:
             dataset="btec",
             reporting_currency="USD",
             sample_interval_seconds=60,
+            hedging_rules=DEFAULT_TEST_HEDGING_RULES,
         )
 
         timeline = build_timeline(trades, config)
@@ -92,6 +110,7 @@ class TestBuildTimeline:
             dataset="btec",
             reporting_currency="USD",
             sample_interval_seconds=30,  # Sample every 30s
+            hedging_rules=DEFAULT_TEST_HEDGING_RULES,
         )
 
         timeline = build_timeline(trades, config)
@@ -110,6 +129,7 @@ class TestBuildTimeline:
             dataset="btec",
             reporting_currency="USD",
             sample_interval_seconds=60,
+            hedging_rules=DEFAULT_TEST_HEDGING_RULES,
         )
 
         timeline = build_timeline(trades, config)
@@ -128,6 +148,7 @@ class TestBuildTimeline:
             dataset="btec",
             reporting_currency="USD",
             sample_interval_seconds=60,
+            hedging_rules=DEFAULT_TEST_HEDGING_RULES,
         )
 
         timeline = build_timeline([], config)
@@ -145,6 +166,7 @@ class TestBuildTimeline:
             dataset="btec",
             reporting_currency="USD",
             sample_interval_seconds=1,  # Sample every 1s (likely overlaps)
+            hedging_rules=DEFAULT_TEST_HEDGING_RULES,
         )
 
         timeline = build_timeline(trades, config)
@@ -167,6 +189,7 @@ class TestBuildTimeline:
             dataset="btec",
             reporting_currency="USD",
             sample_interval_seconds=120,  # Sample every 2 minutes
+            hedging_rules=DEFAULT_TEST_HEDGING_RULES,
         )
 
         timeline = build_timeline(trades, config)
