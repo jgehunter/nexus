@@ -122,13 +122,32 @@ If you see "No datasets yet" even though the backend is running:
 
 ## API Endpoints Available
 
+### Health
 - `GET /api/v1/health` - Backend health check
 - `GET /api/v1/health/detailed` - Detailed health with system metrics
-- `GET /api/v1/datasets` - List all datasets
+
+### Market Datasets
+- `GET /api/v1/datasets` - List all market datasets
 - `GET /api/v1/datasets/{name}` - Get dataset details
 - `GET /api/v1/datasets/{name}/pairs` - Get dataset pairs
 - `GET /api/v1/datasets/{name}/dates` - Get dataset dates
-- `GET /api/v1/data-health?dataset={name}` - Get health report
+- `GET /api/v1/data-health?dataset={name}` - Get market data health report
+
+### Trade Books
+- `GET /api/v1/tradebooks` - List all trade books
+- `GET /api/v1/tradebooks/{name}` - Get trade book details
+- `GET /api/v1/tradebooks/{name}/pairs` - Get trade book pairs
+- `GET /api/v1/tradebooks/{name}/dates` - Get trade book dates
+- `GET /api/v1/tradebooks/{name}/health` - Get trade book health report
+
+### Backtest Runs
+- `GET /api/v1/runs` - List backtest runs
+- `POST /api/v1/runs` - Create new backtest run
+- `GET /api/v1/runs/{id}` - Get run details
+- `GET /api/v1/runs/{id}/results` - Get run results
+
+### Decrossing
+- `POST /api/v1/decross` - Execute trade decrossing
 
 ## Notes
 

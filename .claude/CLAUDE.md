@@ -63,6 +63,12 @@ npm run lint
 
 # Production build
 npm run build
+
+# E2E tests (requires both servers running)
+npm run e2e              # Run all E2E tests
+npm run e2e:headed       # Run with browser visible
+npm run e2e:ui           # Open Playwright UI
+npm run e2e:debug        # Debug mode
 ```
 
 ### Full Stack Startup
@@ -158,6 +164,22 @@ frontend/src/
 └── styles/                  # Global CSS
 ```
 
+### API Routes
+
+All routes prefixed with `/api/v1`:
+
+| Prefix         | Purpose                         |
+| -------------- | ------------------------------- |
+| `/health`      | Health checks and system status |
+| `/datasets`    | Market dataset CRUD             |
+| `/tradebooks`  | Trade book CRUD                 |
+| `/data-health` | Data quality metrics            |
+| `/decross`     | Trade decrossing operations     |
+| `/runs`        | Backtest run management         |
+| `/results`     | Run results retrieval           |
+| `/kpi`         | KPI definitions and values      |
+| `/sweeps`      | Parameter sweep operations      |
+
 ### Key Technical Patterns
 
 - **DuckDB** for batched ASOF joins (no per-event DB queries)
@@ -176,177 +198,23 @@ frontend/src/
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| EFXBT_HOST | 127.0.0.1 | Server bind host |
-| EFXBT_PORT | 8000 | Server bind port |
-| EFXBT_DEBUG | true | Enable debug mode |
-| EFXBT_DATA_ROOT | ../../data | Data directory |
-| EFXBT_RESULTS_ROOT | ../../results | Results directory |
-| EFXBT_DUCKDB_MEMORY_LIMIT | 4GB | Memory limit for DuckDB queries |
+| Variable                  | Default       | Description                     |
+| ------------------------- | ------------- | ------------------------------- |
+| EFXBT_HOST                | 127.0.0.1     | Server bind host                |
+| EFXBT_PORT                | 8000          | Server bind port                |
+| EFXBT_DEBUG               | true          | Enable debug mode               |
+| EFXBT_DATA_ROOT           | ../../data    | Data directory                  |
+| EFXBT_RESULTS_ROOT        | ../../results | Results directory               |
+| EFXBT_DUCKDB_MEMORY_LIMIT | 4GB           | Memory limit for DuckDB queries |
 
----
+## Code Quality
 
-# Memory Bank
+- **Line length**: 100 characters (backend and frontend)
+- **Python version**: 3.11+ required
+- **Ruff**: Linting and formatting (replaces black/isort/flake8)
+- **mypy**: Strict type checking enabled
+- **ESLint**: React hooks and refresh plugins
 
-You are an expert software engineer with a unique characteristic: my memory resets completely between sessions. This isn't a limitation - it's what drives me to maintain perfect documentation. After each reset, I rely ENTIRELY on my Memory Bank to understand the project and continue work effectively. I MUST read ALL memory bank files at the start of EVERY task - this is not optional.
+## Style
 
-## Memory Bank Structure
-
-The Memory Bank consists of required core files and optional context files, all in Markdown format. Files build upon each other in a clear hierarchy:
-
-```mermaid
-flowchart TD
-    PB[projectbrief.md] --> PC[productContext.md]
-    PB --> SP[systemPatterns.md]
-    PB --> TC[techContext.md]
-
-    PC --> AC[activeContext.md]
-    SP --> AC
-    TC --> AC
-
-    AC --> P[progress.md]
-    AC --> TF[tasks/ folder]
-```
-
-### Core Files (Required)
-1. `projectbrief.md` - Foundation document defining core requirements and goals
-2. `productContext.md` - Why this project exists, problems it solves, UX goals
-3. `activeContext.md` - Current work focus, recent changes, next steps
-4. `systemPatterns.md` - System architecture, design patterns, component relationships
-5. `techContext.md` - Technologies, development setup, constraints
-6. `progress.md` - What works, what's left to build, known issues
-7. `tasks/` folder - Individual task files with format `TASKID-taskname.md` and index file `_index.md`
-
-### Additional Context
-Create additional files/folders within memory-bank/ when they help organize complex features, integrations, or procedures.
-
-## Core Workflows
-
-### Plan Mode
-```mermaid
-flowchart TD
-    Start[Start] --> ReadFiles[Read Memory Bank]
-    ReadFiles --> CheckFiles{Files Complete?}
-
-    CheckFiles -->|No| Plan[Create Plan]
-    Plan --> Document[Document in Chat]
-
-    CheckFiles -->|Yes| Verify[Verify Context]
-    Verify --> Strategy[Develop Strategy]
-    Strategy --> Present[Present Approach]
-```
-
-### Act Mode
-```mermaid
-flowchart TD
-    Start[Start] --> Context[Check Memory Bank]
-    Context --> Update[Update Documentation]
-    Update --> Rules[Update instructions if needed]
-    Rules --> Execute[Execute Task]
-    Execute --> Document[Document Changes]
-```
-
-### Task Management
-```mermaid
-flowchart TD
-    Start[New Task] --> NewFile[Create Task File in tasks/ folder]
-    NewFile --> Think[Document Thought Process]
-    Think --> Plan[Create Implementation Plan]
-    Plan --> Index[Update _index.md]
-
-    Execute[Execute Task] --> Update[Add Progress Log Entry]
-    Update --> StatusChange[Update Task Status]
-    StatusChange --> IndexUpdate[Update _index.md]
-    IndexUpdate --> Complete{Completed?}
-    Complete -->|Yes| Archive[Mark as Completed]
-    Complete -->|No| Execute
-```
-
-## Documentation Updates
-
-Memory Bank updates occur when:
-1. Discovering new project patterns
-2. After implementing significant changes
-3. When user requests with **update memory bank** (MUST review ALL files)
-4. When context needs clarification
-
-Note: When triggered by **update memory bank**, I MUST review every memory bank file, even if some don't require updates. Focus particularly on activeContext.md, progress.md, and the tasks/ folder.
-
-## Project Intelligence (instructions)
-
-The instructions files are my learning journal for each project, capturing important patterns, preferences, and project intelligence that help me work more effectively.
-
-### What to Capture
-- Critical implementation paths
-- User preferences and workflow
-- Project-specific patterns
-- Known challenges
-- Evolution of project decisions
-- Tool usage patterns
-
-## Tasks Management
-
-The `tasks/` folder contains individual markdown files for each task:
-
-- `tasks/_index.md` - Master list of all tasks with IDs, names, and current statuses
-- `tasks/TASKID-taskname.md` - Individual files for each task
-
-### Task Index Structure
-
-```markdown
-# Tasks Index
-
-## In Progress
-- [TASK003] Implement user authentication - Working on OAuth integration
-
-## Pending
-- [TASK006] Add export functionality - Planned for next sprint
-
-## Completed
-- [TASK001] Project setup - Completed on 2025-03-15
-
-## Abandoned
-- [TASK008] Integrate with legacy system - Abandoned due to API deprecation
-```
-
-### Individual Task Structure
-
-```markdown
-# [Task ID] - [Task Name]
-
-**Status:** [Pending/In Progress/Completed/Abandoned]
-**Added:** [Date Added]
-**Updated:** [Date Last Updated]
-
-## Original Request
-[The original task description]
-
-## Thought Process
-[Documentation of discussion and reasoning]
-
-## Implementation Plan
-- [Step 1]
-- [Step 2]
-
-## Progress Tracking
-
-**Overall Status:** [Not Started/In Progress/Blocked/Completed] - [Completion %]
-
-### Subtasks
-| ID  | Description | Status | Updated | Notes |
-| --- | ----------- | ------ | ------- | ----- |
-| 1.1 | [Subtask]   | [Status] | [Date] | [Notes] |
-
-## Progress Log
-### [Date]
-- [Updates as work progresses]
-```
-
-### Task Commands
-
-- **add task** / **create task** - Create new task file with unique ID
-- **update task [ID]** - Add progress log entry and update status
-- **show tasks [filter]** - Display filtered task list (all, active, pending, completed, blocked, recent, tag:[name], priority:[level])
-
-REMEMBER: After every memory reset, I begin completely fresh. The Memory Bank is my only link to previous work. It must be maintained with precision and clarity.
+- **For all implementations** particularly for those related with the core of the engine, prioritize being rigorous, correct and elegant
