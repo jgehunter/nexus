@@ -3,6 +3,7 @@
  */
 
 import { apiGet, apiPost, apiDelete } from './client'
+import type { HedgingRuleSet } from './runs'
 
 // -----------------------------------------------------------------------------
 // Type Definitions
@@ -17,11 +18,14 @@ export interface ParameterRange {
 }
 
 export interface SweepParameterGrid {
-  risk_band_qty?: number[] | ParameterRange
-  hedge_mode?: string[]
-  hedge_policy?: string[]
+  // Hedging rule presets to sweep (indices into hedging_rules_presets)
+  hedging_rules_index?: number[]
+  // Hedge delay in milliseconds
+  hedge_delay_ms?: number[] | ParameterRange
+  // Simulation config parameters
   reporting_currency?: string[]
   sample_interval_seconds?: number[] | ParameterRange
+  // Decross config parameters
   max_path_length?: number[] | ParameterRange
   min_leg_qty?: number[] | ParameterRange
   priority_currencies?: string[][]
@@ -32,6 +36,8 @@ export interface SweepConfig {
   tradebook: string
   start_date?: string | null
   end_date?: string | null
+  // List of hedging rule configurations to sweep over
+  hedging_rules_presets?: HedgingRuleSet[]
   base_simulation_config?: Record<string, unknown>
   base_decross_config?: Record<string, unknown>
   base_general_config?: Record<string, unknown>

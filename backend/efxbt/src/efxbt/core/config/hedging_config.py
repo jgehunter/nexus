@@ -225,6 +225,10 @@ class HedgingRuleSet(BaseModel):
         )
     """
 
+    name: str | None = Field(
+        default=None,
+        description="Optional name for this rule set (for display/identification)",
+    )
     groups: list[PairGroup] = Field(
         default_factory=list,
         description="Custom pair groups",

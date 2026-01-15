@@ -49,6 +49,7 @@ export interface HedgingRule {
 }
 
 export interface HedgingRuleSet {
+  name?: string // Optional name for the rule set
   groups: PairGroup[]
   rules: HedgingRule[]
 }
