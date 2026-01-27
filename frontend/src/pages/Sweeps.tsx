@@ -14,21 +14,13 @@ import {
   type SweepConfig,
   type SweepStatus,
   type SweepStatusResponse,
-  type ParameterRange,
 } from '../api/sweeps'
-import { listDatasets, type DatasetSummary } from '../api/datasets'
+import { listDatasets, type DatasetSummary, getDataset } from '../api/datasets'
 import { listTradeBooks, type TradeBookSummary } from '../api/tradebooks'
+import type { HedgingRuleSet, HedgingRule } from '../api/runs'
+import { HedgingRuleBuilder } from '../components/runs/HedgingRuleBuilder'
 
 type View = 'list' | 'create' | 'progress'
-
-interface ParameterEntry {
-  name: string
-  type: 'list' | 'range'
-  values: string // Comma-separated for list
-  min: number
-  max: number
-  step: number
-}
 
 // Format timestamp for display
 function formatTimestamp(ms: number): string {
@@ -203,6 +195,104 @@ function SweepList({
   )
 }
 
+// Large number to represent infinity for JSON serialization
+const INFINITY_SUBSTITUTE = 1e18
+
+// Sanitize a rule set for JSON serialization (convert Infinity to large number)
+function sanitizeRuleSetForApi(ruleSet: HedgingRuleSet): HedgingRuleSet {
+  return {
+    ...ruleSet,
+    rules: ruleSet.rules.map(rule => ({
+      ...rule,
+      from_amount: Number.isFinite(rule.from_amount) ? rule.from_amount : INFINITY_SUBSTITUTE,
+      to_amount: Number.isFinite(rule.to_amount) ? rule.to_amount : INFINITY_SUBSTITUTE,
+    })),
+  }
+}
+
+// Create a default hedging rule set
+function createDefaultRuleSet(name: string): HedgingRuleSet {
+  return {
+    name,
+    groups: [],
+    rules: [
+      {
+        pair_or_group: 'ALL',
+        amount_type: 'absolute',
+        from_amount: 0,
+        to_amount: Infinity,
+        action: { action_type: 'no_hedge' },
+      } as HedgingRule,
+    ],
+  }
+}
+
+// Preset templates for common hedging strategies
+const HEDGING_TEMPLATES: { name: string; create: () => HedgingRuleSet }[] = [
+  {
+    name: 'No Hedge',
+    create: () => ({
+      name: 'No Hedge',
+      groups: [],
+      rules: [
+        {
+          pair_or_group: 'ALL',
+          amount_type: 'absolute',
+          from_amount: 0,
+          to_amount: Infinity,
+          action: { action_type: 'no_hedge' },
+        } as HedgingRule,
+      ],
+    }),
+  },
+  {
+    name: 'Hedge 100% Above 1M',
+    create: () => ({
+      name: 'Hedge 100% Above 1M',
+      groups: [],
+      rules: [
+        {
+          pair_or_group: 'ALL',
+          amount_type: 'absolute',
+          from_amount: 0,
+          to_amount: 1000000,
+          action: { action_type: 'no_hedge' },
+        } as HedgingRule,
+        {
+          pair_or_group: 'ALL',
+          amount_type: 'absolute',
+          from_amount: 1000000,
+          to_amount: Infinity,
+          action: { action_type: 'hedge_percentage', hedge_percentage: 1.0 },
+        } as HedgingRule,
+      ],
+    }),
+  },
+  {
+    name: 'Hedge to 50% Above 1M',
+    create: () => ({
+      name: 'Hedge to 50% Above 1M',
+      groups: [],
+      rules: [
+        {
+          pair_or_group: 'ALL',
+          amount_type: 'absolute',
+          from_amount: 0,
+          to_amount: 1000000,
+          action: { action_type: 'no_hedge' },
+        } as HedgingRule,
+        {
+          pair_or_group: 'ALL',
+          amount_type: 'absolute',
+          from_amount: 1000000,
+          to_amount: Infinity,
+          action: { action_type: 'hedge_to_target', target_percentage: 0.5 },
+        } as HedgingRule,
+      ],
+    }),
+  },
+]
+
 // Sweep create form component
 function SweepCreateForm({
   onCreated,
@@ -216,12 +306,20 @@ function SweepCreateForm({
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [availablePairs, setAvailablePairs] = useState<string[]>([])
 
   // Form state
   const [dataset, setDataset] = useState('')
   const [tradebook, setTradebook] = useState('')
   const [name, setName] = useState('')
-  const [parameters, setParameters] = useState<ParameterEntry[]>([])
+
+  // Simulation config (fixed for all runs in sweep)
+  const [hedgeDelayMs, setHedgeDelayMs] = useState(0)
+  const [sampleIntervalSeconds, setSampleIntervalSeconds] = useState(60)
+
+  // Hedging rule presets state
+  const [hedgingPresets, setHedgingPresets] = useState<HedgingRuleSet[]>([])
+  const [expandedPresetIndex, setExpandedPresetIndex] = useState<number | null>(null)
 
   useEffect(() => {
     async function loadData() {
@@ -240,22 +338,48 @@ function SweepCreateForm({
     loadData()
   }, [])
 
-  const addParameter = (paramName: string) => {
-    if (parameters.some(p => p.name === paramName)) return
-    setParameters([
-      ...parameters,
-      { name: paramName, type: 'list', values: '', min: 0, max: 0, step: 1 }
-    ])
+  // Load available pairs when dataset changes
+  useEffect(() => {
+    async function loadPairs() {
+      if (!dataset) return
+      try {
+        const detail = await getDataset(dataset)
+        setAvailablePairs(detail.pairs || [])
+      } catch {
+        setAvailablePairs([])
+      }
+    }
+    loadPairs()
+  }, [dataset])
+
+  // Hedging preset management
+  const addPresetFromTemplate = (template: typeof HEDGING_TEMPLATES[0]) => {
+    setHedgingPresets([...hedgingPresets, template.create()])
   }
 
-  const removeParameter = (paramName: string) => {
-    setParameters(parameters.filter(p => p.name !== paramName))
+  const addCustomPreset = () => {
+    const presetNum = hedgingPresets.length + 1
+    setHedgingPresets([...hedgingPresets, createDefaultRuleSet(`Preset ${presetNum}`)])
+    setExpandedPresetIndex(hedgingPresets.length)
   }
 
-  const updateParameter = (paramName: string, updates: Partial<ParameterEntry>) => {
-    setParameters(parameters.map(p =>
-      p.name === paramName ? { ...p, ...updates } : p
-    ))
+  const removePreset = (index: number) => {
+    setHedgingPresets(hedgingPresets.filter((_, i) => i !== index))
+    if (expandedPresetIndex === index) {
+      setExpandedPresetIndex(null)
+    } else if (expandedPresetIndex !== null && expandedPresetIndex > index) {
+      setExpandedPresetIndex(expandedPresetIndex - 1)
+    }
+  }
+
+  const updatePreset = (index: number, ruleSet: HedgingRuleSet) => {
+    setHedgingPresets(hedgingPresets.map((p, i) => (i === index ? ruleSet : p)))
+  }
+
+  const updatePresetName = (index: number, newName: string) => {
+    setHedgingPresets(
+      hedgingPresets.map((p, i) => (i === index ? { ...p, name: newName } : p))
+    )
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -266,32 +390,26 @@ function SweepCreateForm({
     setError(null)
 
     try {
-      // Build parameter grid
+      // Build parameter grid - only hedging_rules_index if multiple presets
       const parameterGrid: Record<string, unknown> = {}
-      for (const param of parameters) {
-        if (param.type === 'list') {
-          const values = param.values.split(',').map(v => {
-            const trimmed = v.trim()
-            const num = Number(trimmed)
-            return isNaN(num) ? trimmed : num
-          }).filter(v => v !== '')
-          if (values.length > 0) {
-            parameterGrid[param.name] = values
-          }
-        } else {
-          const range: ParameterRange = {
-            min: param.min,
-            max: param.max,
-            step: param.step,
-          }
-          parameterGrid[param.name] = range
-        }
+      if (hedgingPresets.length > 1) {
+        parameterGrid['hedging_rules_index'] = hedgingPresets.map((_, i) => i)
       }
+
+      // Determine hedging presets to use and sanitize for API
+      const presetsToUse = hedgingPresets.length > 0
+        ? hedgingPresets.map(sanitizeRuleSetForApi)
+        : [sanitizeRuleSetForApi(createDefaultRuleSet('No Hedge'))]
 
       const config: SweepConfig = {
         dataset,
         tradebook,
         name: name || undefined,
+        hedging_rules_presets: presetsToUse,
+        base_simulation_config: {
+          hedge_delay_ms: hedgeDelayMs,
+          sample_interval_seconds: sampleIntervalSeconds,
+        },
         parameter_grid: parameterGrid as SweepConfig['parameter_grid'],
       }
 
@@ -307,14 +425,6 @@ function SweepCreateForm({
   if (loading) {
     return <div className="loading">Loading...</div>
   }
-
-  const availableParams = [
-    { name: 'risk_band_qty', label: 'Risk Band Qty' },
-    { name: 'hedge_mode', label: 'Hedge Mode' },
-    { name: 'hedge_policy', label: 'Hedge Policy' },
-    { name: 'max_path_length', label: 'Max Path Length' },
-    { name: 'min_leg_qty', label: 'Min Leg Qty' },
-  ]
 
   return (
     <form className="sweep-create-form" onSubmit={handleSubmit}>
@@ -363,86 +473,83 @@ function SweepCreateForm({
         </div>
       </div>
 
+      {/* Hedging Rule Presets Section */}
       <div className="form-section">
-        <h3>Parameter Grid</h3>
+        <h3>Hedging Rule Presets</h3>
         <p className="form-hint">
-          Add parameters to sweep over. Each creates multiple configuration combinations.
+          Define different hedging strategies to compare. The sweep will test each preset.
         </p>
 
-        <div className="param-buttons">
-          {availableParams.map(p => (
+        {/* Template buttons */}
+        <div className="preset-templates">
+          <span className="template-label">Quick add:</span>
+          {HEDGING_TEMPLATES.map((template) => (
             <button
-              key={p.name}
+              key={template.name}
               type="button"
-              className="btn btn-sm"
-              onClick={() => addParameter(p.name)}
-              disabled={parameters.some(param => param.name === p.name)}
+              className="btn btn-sm btn-secondary"
+              onClick={() => addPresetFromTemplate(template)}
             >
-              + {p.label}
+              {template.name}
             </button>
           ))}
+          <button
+            type="button"
+            className="btn btn-sm btn-primary"
+            onClick={addCustomPreset}
+          >
+            + Custom
+          </button>
         </div>
 
-        {parameters.length > 0 && (
-          <div className="param-list">
-            {parameters.map(param => (
-              <div key={param.name} className="param-entry">
-                <div className="param-header">
-                  <strong>{param.name}</strong>
-                  <button
-                    type="button"
-                    className="btn btn-danger btn-xs"
-                    onClick={() => removeParameter(param.name)}
-                  >
-                    Remove
-                  </button>
-                </div>
-
-                <div className="param-type">
-                  <label>
-                    <input
-                      type="radio"
-                      checked={param.type === 'list'}
-                      onChange={() => updateParameter(param.name, { type: 'list' })}
-                    />
-                    Explicit Values
-                  </label>
-                  <label>
-                    <input
-                      type="radio"
-                      checked={param.type === 'range'}
-                      onChange={() => updateParameter(param.name, { type: 'range' })}
-                    />
-                    Range
-                  </label>
-                </div>
-
-                {param.type === 'list' ? (
+        {/* Preset list */}
+        {hedgingPresets.length > 0 && (
+          <div className="presets-list">
+            {hedgingPresets.map((preset, index) => (
+              <div key={index} className="preset-card">
+                <div className="preset-header">
                   <input
                     type="text"
-                    placeholder="e.g., 1000000, 5000000, 10000000"
-                    value={param.values}
-                    onChange={e => updateParameter(param.name, { values: e.target.value })}
+                    className="preset-name-input"
+                    value={preset.name || `Preset ${index + 1}`}
+                    onChange={(e) => updatePresetName(index, e.target.value)}
+                    placeholder={`Preset ${index + 1}`}
                   />
-                ) : (
-                  <div className="range-inputs">
-                    <input
-                      type="number"
-                      placeholder="Min"
-                      value={param.min || ''}
-                      onChange={e => updateParameter(param.name, { min: Number(e.target.value) })}
-                    />
-                    <input
-                      type="number"
-                      placeholder="Max"
-                      value={param.max || ''}
-                      onChange={e => updateParameter(param.name, { max: Number(e.target.value) })}
-                    />
-                    <input
-                      type="number"
-                      placeholder="Step"
-                      value={param.step || ''}
-                      onChange={e => updateParameter(param.name, { step: Number(e.target.value) })}
+                  <div className="preset-actions">
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-ghost"
+                      onClick={() =>
+                        setExpandedPresetIndex(expandedPresetIndex === index ? null : index)
+                      }
+                    >
+                      {expandedPresetIndex === index ? 'Collapse' : 'Edit'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-ghost btn-danger-text"
+                      onClick={() => removePreset(index)}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                </div>
+
+                {/* Summary when collapsed */}
+                {expandedPresetIndex !== index && (
+                  <div className="preset-summary">
+                    {preset.rules.length} rule{preset.rules.length !== 1 ? 's' : ''}
+                    {preset.groups.length > 0 && `, ${preset.groups.length} group${preset.groups.length !== 1 ? 's' : ''}`}
+                  </div>
+                )}
+
+                {/* Expanded rule builder */}
+                {expandedPresetIndex === index && (
+                  <div className="preset-expanded">
+                    <HedgingRuleBuilder
+                      ruleSet={preset}
+                      availablePairs={availablePairs}
+                      onChange={(ruleSet) => updatePreset(index, ruleSet)}
                     />
                   </div>
                 )}
@@ -451,11 +558,53 @@ function SweepCreateForm({
           </div>
         )}
 
-        {parameters.length === 0 && (
-          <p className="empty-params">
-            No parameters added. The sweep will run a single configuration.
+        {hedgingPresets.length === 0 && (
+          <p className="empty-presets">
+            No presets defined. A default "No Hedge" preset will be used.
           </p>
         )}
+
+        {hedgingPresets.length > 1 && (
+          <p className="sweep-info">
+            The sweep will run {hedgingPresets.length} configurations, one for each preset.
+          </p>
+        )}
+      </div>
+
+      {/* Simulation Settings */}
+      <div className="form-section">
+        <h3>Simulation Settings</h3>
+        <p className="form-hint">
+          Configure simulation parameters that apply to all runs in the sweep.
+        </p>
+
+        <div className="form-row">
+          <div className="form-group">
+            <label htmlFor="hedgeDelay">Hedge Delay (ms)</label>
+            <input
+              id="hedgeDelay"
+              type="number"
+              min={0}
+              step={1}
+              value={hedgeDelayMs}
+              onChange={e => setHedgeDelayMs(Number(e.target.value) || 0)}
+            />
+            <span className="form-help">Delay before hedge execution (0 = immediate)</span>
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="sampleInterval">Sample Interval (seconds)</label>
+            <input
+              id="sampleInterval"
+              type="number"
+              min={1}
+              step={1}
+              value={sampleIntervalSeconds}
+              onChange={e => setSampleIntervalSeconds(Number(e.target.value) || 60)}
+            />
+            <span className="form-help">How often to sample positions for metrics</span>
+          </div>
+        </div>
       </div>
 
       <div className="form-actions">
@@ -486,15 +635,33 @@ function SweepProgress({
   const [error, setError] = useState<string | null>(null)
   const [started, setStarted] = useState(false)
 
+  // Auto-start sweep if needed (only if status is pending)
   useEffect(() => {
-    if (autoStart && !started) {
-      setStarted(true)
-      startSweep(sweepId)
-        .then(setStatus)
-        .catch(e => setError(e instanceof Error ? e.message : 'Failed to start sweep'))
+    if (!autoStart || started) return
+
+    async function maybeStart() {
+      try {
+        const currentStatus = await getSweepStatus(sweepId)
+        setStatus(currentStatus)
+
+        // Only start if pending
+        if (currentStatus.status === 'pending') {
+          setStarted(true)
+          const newStatus = await startSweep(sweepId)
+          setStatus(newStatus)
+        } else {
+          // Already running or completed, just mark as started to prevent retries
+          setStarted(true)
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Failed to start sweep')
+      }
     }
+
+    maybeStart()
   }, [sweepId, autoStart, started])
 
+  // Poll for status updates
   useEffect(() => {
     const interval = setInterval(async () => {
       try {
@@ -507,9 +674,6 @@ function SweepProgress({
         setError(e instanceof Error ? e.message : 'Failed to get status')
       }
     }, 2000)
-
-    // Initial fetch
-    getSweepStatus(sweepId).then(setStatus).catch(() => {})
 
     return () => clearInterval(interval)
   }, [sweepId])

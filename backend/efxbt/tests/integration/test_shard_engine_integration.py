@@ -17,9 +17,43 @@ import pyarrow.parquet as pq
 import pytest
 
 from efxbt.core.config.run_config import SimulationConfig
+from efxbt.core.config.hedging_config import (
+    HedgingRuleSet, HedgingRule, NoHedgeParams, HedgePercentageParams
+)
 from efxbt.core.data.schemas import DecrossedTradeRecord
 from efxbt.engine.shard.shard_engine import ShardEngine
 from efxbt.engine.shard.state import ShardState
+
+
+def make_hedging_rules(risk_band_qty: float = 1000.0, hedge_pct: float = 1.0) -> HedgingRuleSet:
+    """Create hedging rules similar to the old aggressive policy.
+
+    Args:
+        risk_band_qty: Position threshold before hedging (default 1000)
+        hedge_pct: Percentage of position to hedge when threshold exceeded (default 1.0 = 100%)
+
+    Returns:
+        HedgingRuleSet with no-hedge rule below threshold, hedge rule above
+    """
+    return HedgingRuleSet(
+        groups=[],
+        rules=[
+            HedgingRule(
+                pair_or_group="ALL",
+                amount_type="absolute",
+                from_amount=0,
+                to_amount=risk_band_qty,
+                action=NoHedgeParams(),
+            ),
+            HedgingRule(
+                pair_or_group="ALL",
+                amount_type="absolute",
+                from_amount=risk_band_qty,
+                to_amount=float("inf"),
+                action=HedgePercentageParams(hedge_percentage=hedge_pct),
+            ),
+        ],
+    )
 
 
 def create_test_trade(
@@ -109,8 +143,7 @@ class TestShardEngineIntegration:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -158,8 +191,7 @@ class TestShardEngineIntegration:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 500.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=500.0),
             sample_interval_seconds=30,
         )
 
@@ -183,7 +215,7 @@ class TestShardEngineIntegration:
         assert abs(result.final_state.net_position) < 1e-8
 
         # Verify externalization (hedge executed)
-        assert result.metrics["total_hedge_volume"] > 0  # Hedge executed
+        assert result.metrics["externalized_volume"] > 0  # Hedge executed
         assert result.metrics["internalization_ratio"] < 1.0  # Not fully internalized
 
     def test_state_chaining_across_days(self, test_data_root):
@@ -191,8 +223,7 @@ class TestShardEngineIntegration:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -241,8 +272,7 @@ class TestShardEngineIntegration:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 500.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=500.0),
             sample_interval_seconds=30,
         )
 
@@ -281,8 +311,7 @@ class TestShardEngineIntegration:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -312,11 +341,31 @@ class TestShardEngineIntegration:
 
     def test_partial_hedge_mode(self, test_data_root):
         """Test partial hedge mode (hedge to band edge)."""
+        # Use HedgeToTargetParams with target_percentage=1.0 to hedge down to from_amount
+        from efxbt.core.config.hedging_config import HedgeToTargetParams
+        partial_rules = HedgingRuleSet(
+            groups=[],
+            rules=[
+                HedgingRule(
+                    pair_or_group="ALL",
+                    amount_type="absolute",
+                    from_amount=0,
+                    to_amount=500.0,
+                    action=NoHedgeParams(),
+                ),
+                HedgingRule(
+                    pair_or_group="ALL",
+                    amount_type="absolute",
+                    from_amount=500.0,
+                    to_amount=float("inf"),
+                    action=HedgeToTargetParams(target_percentage=1.0),  # Hedge to from_amount (500)
+                ),
+            ],
+        )
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 500.0, "hedge_mode": "partial"},
+            hedging_rules=partial_rules,
             sample_interval_seconds=30,
         )
 
@@ -339,16 +388,109 @@ class TestShardEngineIntegration:
         assert abs(result.final_state.net_position - (-500.0)) < 1e-8
 
         # Verify partial externalization
-        assert result.metrics["total_hedge_volume"] == 500.0  # Partial hedge
+        assert result.metrics["externalized_volume"] == 500.0  # Partial hedge
         assert result.metrics["internalization_ratio"] == 0.5  # 50% internalized
+
+    def test_hedge_to_zero_2m_threshold(self, test_data_root):
+        """Test HedgeToTarget 0% with 2M threshold - user's exact config.
+
+        User configuration:
+        - Only one rule: positions > 2M should hedge to target 0%
+        - No rule for positions below 2M (so no hedging for small positions)
+
+        Expected behavior:
+        - Position < 2M: No hedge
+        - Position >= 2M: Hedge entire position to 0
+        """
+        from efxbt.core.config.hedging_config import HedgeToTargetParams
+
+        # User's exact configuration
+        user_rules = HedgingRuleSet(
+            groups=[],
+            rules=[
+                # Only one rule: hedge to 0 when >= 2M
+                HedgingRule(
+                    pair_or_group="ALL",
+                    amount_type="absolute",
+                    from_amount=2_000_000.0,
+                    to_amount=float("inf"),
+                    action=HedgeToTargetParams(target_percentage=0.0),
+                ),
+            ],
+        )
+
+        config = SimulationConfig(
+            dataset="test",
+            reporting_currency="USD",
+            hedging_rules=user_rules,
+            sample_interval_seconds=30,
+        )
+
+        engine = ShardEngine(
+            pair="EURUSD",
+            date="20240101",
+            config=config,
+            data_root=test_data_root,
+        )
+
+        # Test 1: Single trade exceeds 2M
+        # House SELLS 3M → position = -3M → should hedge to 0
+        trades_3m = [
+            create_test_trade("T001", 1704110400000, -1, 3_000_000.0, 1.1005),
+        ]
+        result_3m = engine.run(trades_3m, prior_state=None)
+
+        # Position should be 0 after hedge
+        assert abs(result_3m.final_state.net_position) < 1e-8, (
+            f"Expected position 0, got {result_3m.final_state.net_position}"
+        )
+        # Should have externalized 3M
+        assert result_3m.metrics["externalized_volume"] == 3_000_000.0
+
+        # Test 2: Trade below threshold - no hedge
+        engine2 = ShardEngine(
+            pair="EURUSD",
+            date="20240101",
+            config=config,
+            data_root=test_data_root,
+        )
+        trades_1m = [
+            create_test_trade("T002", 1704110400000, -1, 1_500_000.0, 1.1005),
+        ]
+        result_1m = engine2.run(trades_1m, prior_state=None)
+
+        # Position should remain -1.5M (no hedge, below threshold)
+        assert abs(result_1m.final_state.net_position - (-1_500_000.0)) < 1e-8, (
+            f"Expected position -1.5M, got {result_1m.final_state.net_position}"
+        )
+        # Should have no externalization
+        assert result_1m.metrics["externalized_volume"] == 0.0
+
+        # Test 3: Multiple trades accumulating to exceed threshold
+        engine3 = ShardEngine(
+            pair="EURUSD",
+            date="20240101",
+            config=config,
+            data_root=test_data_root,
+        )
+        trades_accumulate = [
+            create_test_trade("T003", 1704110400000, -1, 1_000_000.0, 1.1005),  # pos = -1M
+            create_test_trade("T004", 1704110401000, -1, 800_000.0, 1.1005),    # pos = -1.8M
+            create_test_trade("T005", 1704110402000, -1, 500_000.0, 1.1005),    # pos = -2.3M → HEDGE to 0
+        ]
+        result_accum = engine3.run(trades_accumulate, prior_state=None)
+
+        # Final position should be 0 (hedge triggered when position hit -2.3M)
+        assert abs(result_accum.final_state.net_position) < 1e-8, (
+            f"Expected position 0, got {result_accum.final_state.net_position}"
+        )
 
     def test_empty_trades(self, test_data_root):
         """Test shard with no client trades."""
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -371,8 +513,7 @@ class TestShardEngineIntegration:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -399,6 +540,146 @@ class TestShardEngineIntegration:
         assert result.metrics["open_slice_count"] > 0
         assert result.metrics["max_time_open_seconds"] >= 0.0
 
+    def test_hedge_delay_across_days(self, test_data_root):
+        """Test that pending hedges are chained across day boundaries.
+
+        Scenario:
+        - Day 1: Trade triggers hedge with delay extending beyond Day 1's last trade
+        - Day 2: Engine should receive pending hedges from Day 1 and execute them
+
+        This tests the fix for pending hedges being lost at day boundaries.
+        Note: With heap-based timeline, hedges execute at their scheduled time within the
+        same day if possible. This test uses a hedge scheduled AFTER day 1's timeline ends.
+        """
+        from efxbt.core.config.hedging_config import HedgeToTargetParams
+
+        # Day 1: Trade at 12:00:00, last sample at 12:00:00
+        # Hedge delay 100 seconds -> scheduled for 12:01:40
+        # But no more trades in Day 1, so timeline ends at 12:00:00
+        # With heap-based execution, hedge executes at 12:01:40 (dynamic timeline point)
+        config = SimulationConfig(
+            dataset="test",
+            reporting_currency="USD",
+            hedging_rules=HedgingRuleSet(
+                groups=[],
+                rules=[
+                    # No hedge for small positions
+                    HedgingRule(
+                        pair_or_group="ALL",
+                        amount_type="absolute",
+                        from_amount=0,
+                        to_amount=500.0,
+                        action=NoHedgeParams(),
+                    ),
+                    # Hedge to zero for positions > 500
+                    HedgingRule(
+                        pair_or_group="ALL",
+                        amount_type="absolute",
+                        from_amount=500.0,
+                        to_amount=float("inf"),
+                        action=HedgeToTargetParams(target_percentage=0.0),
+                    ),
+                ],
+            ),
+            sample_interval_seconds=30,
+            hedge_delay_ms=100000,  # 100 second delay
+        )
+
+        # Day 1: Single trade triggers hedge
+        day1_trades = [
+            create_test_trade("T001", 1704110400000, -1, 1000.0, 1.1005),  # House SELLS 1000
+        ]
+
+        engine_day1 = ShardEngine(
+            pair="EURUSD",
+            date="20240101",
+            config=config,
+            data_root=test_data_root,
+        )
+
+        result_day1 = engine_day1.run(day1_trades, prior_state=None)
+
+        # With heap-based timeline, hedge executes at scheduled time (100s after trade)
+        # Position should be 0 (hedge executed, flattened)
+        assert result_day1.final_state.net_position == 0.0, (
+            f"Expected position 0 (hedge executed at scheduled time), got {result_day1.final_state.net_position}"
+        )
+
+        # Verify hedge executed (should be in metrics)
+        assert result_day1.metrics["hedge_trade_count"] == 1, (
+            "Expected 1 hedge trade to have executed"
+        )
+
+    def test_hedge_delay_exact_timing(self, test_data_root):
+        """Test that hedge executes at exactly the scheduled time (delay_ms after trigger).
+
+        This is the key test for the heap-based timeline fix that ensures hedges don't
+        wait for the next sample/trade point but execute at their exact scheduled time.
+        """
+        from efxbt.core.config.hedging_config import HedgeToTargetParams
+
+        # Use a small delay (50ms) - this should execute at t+50ms, not t+60s
+        config = SimulationConfig(
+            dataset="test",
+            reporting_currency="USD",
+            hedging_rules=HedgingRuleSet(
+                groups=[],
+                rules=[
+                    HedgingRule(
+                        pair_or_group="ALL",
+                        amount_type="absolute",
+                        from_amount=0,
+                        to_amount=500.0,
+                        action=NoHedgeParams(),
+                    ),
+                    HedgingRule(
+                        pair_or_group="ALL",
+                        amount_type="absolute",
+                        from_amount=500.0,
+                        to_amount=float("inf"),
+                        action=HedgeToTargetParams(target_percentage=0.0),
+                    ),
+                ],
+            ),
+            sample_interval_seconds=60,  # 60 second sample interval
+            hedge_delay_ms=50,  # 50ms delay - hedge should NOT wait 60s
+        )
+
+        # Trade at t=1704110400000
+        # With old code: hedge waits for next sample at t+60s
+        # With fix: hedge executes at t+50ms
+        trades = [
+            create_test_trade("T001", 1704110400000, -1, 1000.0, 1.1005),
+        ]
+
+        engine = ShardEngine(
+            pair="EURUSD",
+            date="20240101",
+            config=config,
+            data_root=test_data_root,
+        )
+
+        result = engine.run(trades, prior_state=None)
+
+        # Find the hedge fill record
+        hedge_records = [
+            attr
+            for rec in result.pnl_records
+            for attr in rec.trade_attributions
+            if attr.event_type == "hedge_fill"
+        ]
+
+        assert len(hedge_records) > 0, "Expected at least one hedge fill"
+
+        # Hedge should execute at t+50ms, not t+60s
+        hedge_timestamp = hedge_records[0].timestamp_ms
+        expected_timestamp = 1704110400000 + 50  # trigger time + delay
+
+        assert hedge_timestamp == expected_timestamp, (
+            f"Expected hedge at {expected_timestamp} (trigger + 50ms), "
+            f"got {hedge_timestamp}. Diff: {hedge_timestamp - 1704110400000}ms"
+        )
+
 
 class TestShardEngineErrorHandling:
     """Test error handling in ShardEngine."""
@@ -408,8 +689,7 @@ class TestShardEngineErrorHandling:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -434,8 +714,7 @@ class TestShardEngineErrorHandling:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 

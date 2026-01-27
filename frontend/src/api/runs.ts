@@ -10,18 +10,57 @@ import { apiGet, apiPost, apiDelete } from './client'
 
 export type RunStatus = 'created' | 'running' | 'completed' | 'failed' | 'cancelled'
 
-export interface HedgePolicyConfig {
-  risk_band_qty: number
-  hedge_mode: string
-  pair_bands?: Record<string, number>
+// === EXTENSIBLE ACTION SYSTEM ===
+// To add a new action:
+// 1. Create a new interface with action_type literal
+// 2. Add it to the ActionParams union type
+// 3. Update HedgingRuleBuilder component to handle new action
+
+export interface NoHedgeParams {
+  action_type: 'no_hedge'
+}
+
+export interface HedgeToTargetParams {
+  action_type: 'hedge_to_target'
+  target_percentage: number // 0.0 - 1.0
+}
+
+export interface HedgePercentageParams {
+  action_type: 'hedge_percentage'
+  hedge_percentage: number // 0.0 - 1.0
+}
+
+// Discriminated union for all action types
+export type ActionParams = NoHedgeParams | HedgeToTargetParams | HedgePercentageParams
+
+export type AmountType = 'absolute' | 'signed'
+
+export interface PairGroup {
+  name: string
+  pairs: string[]
+}
+
+export interface HedgingRule {
+  pair_or_group: string
+  amount_type: AmountType
+  from_amount: number
+  to_amount: number
+  action: ActionParams // Discriminated union
+}
+
+export interface HedgingRuleSet {
+  name?: string // Optional name for the rule set
+  groups: PairGroup[]
+  rules: HedgingRule[]
 }
 
 export interface SimulationConfig {
   dataset: string
   reporting_currency: string
-  hedge_policy: string
-  hedge_policy_config: HedgePolicyConfig
   sample_interval_seconds: number
+  use_mid_for_unrealized?: boolean
+  hedging_rules: HedgingRuleSet // REQUIRED - replaces hedge_policy + hedge_policy_config
+  hedge_delay_ms?: number // Delay in ms before hedge execution (0 = immediate)
 }
 
 export interface DecrossConfig {

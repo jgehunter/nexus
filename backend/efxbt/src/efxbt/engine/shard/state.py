@@ -274,6 +274,7 @@ class TradePnLAttribution(BaseModel):
     )
     triggered_hedge: bool = False
     hedge_allocation_pct: float = 0.0  # % of hedge cost attributed to this trade
+    net_position: float = 0.0  # Position after this event
 
 
 class PnLAttributionRecord(BaseModel):

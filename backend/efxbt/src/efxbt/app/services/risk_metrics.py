@@ -82,9 +82,15 @@ class RiskMetricsCalculator:
             return self._empty_metrics()
 
         # Get risk band threshold from config
+        # With the new rule-based system, we derive a reasonable threshold from the first
+        # hedging rule's from_amount (where hedging typically starts), or use a default
         risk_band = 1000.0  # Default
-        if config and config.hedge_policy_config:
-            risk_band = config.hedge_policy_config.get("risk_band_qty", 1000.0)
+        if config and config.hedging_rules and config.hedging_rules.rules:
+            # Find the first rule that triggers hedging (not no_hedge)
+            for rule in config.hedging_rules.rules:
+                if rule.action.action_type != "no_hedge" and rule.from_amount > 0:
+                    risk_band = rule.from_amount
+                    break
 
         # Calculate metrics with progress logging
         print(f"[RISK] Computing risk metrics ({len(data.get('timestamp_ms', []))} events)...", flush=True)
@@ -92,7 +98,7 @@ class RiskMetricsCalculator:
         print(f"[RISK] Risk metrics done", flush=True)
 
         print(f"[RISK] Computing ops metrics...", flush=True)
-        ops = self._compute_ops_metrics(data, client_volume)
+        ops = self._compute_ops_metrics(data, client_volume, direct_pairs)
         print(f"[RISK] Ops metrics done", flush=True)
 
         print(f"[RISK] Computing internalization metrics...", flush=True)
@@ -165,14 +171,13 @@ class RiskMetricsCalculator:
         if len(timestamps) == 0:
             return self._empty_risk_metrics()
 
-        # Build position timeseries from trade data
-        # We need to reconstruct position from fills
-        # event_type indicates "client_fill" or "hedge_fill"
+        # Get position data from stored net_position column
         event_types = data.get("event_type", [])
-        sides = np.array(data.get("side", []))
-        qtys = np.array(data.get("qty", []))
         pairs = data.get("pair", [])
         prices = np.array(data.get("price", [1.0] * len(timestamps)))
+        net_positions = np.array(data.get("net_position", [0.0] * len(timestamps)))
+        sides = np.array(data.get("side", []))
+        qtys = np.array(data.get("qty", []))
 
         # Track positions per pair (not aggregate raw base currency)
         # This allows proper USD conversion for cross-pair metrics
@@ -217,9 +222,9 @@ class RiskMetricsCalculator:
             aggregate_usd_exposures.append(aggregate_usd)
             aggregate_timestamps.append(int(timestamps[i]))
 
-        # Build position timeseries per direct pair
+        # Build position timeseries per direct pair (using stored net_position)
         position_timeseries = self._compute_position_timeseries_by_pair(
-            timestamps, event_types, sides, qtys, pairs, prices, direct_pairs
+            timestamps, event_types, pairs, prices, net_positions, direct_pairs
         )
 
         # Inventory metrics on aggregate USD exposures
@@ -286,21 +291,19 @@ class RiskMetricsCalculator:
         self,
         timestamps: np.ndarray,
         event_types: list,
-        sides: np.ndarray,
-        qtys: np.ndarray,
         pairs: list,
         prices: np.ndarray,
+        net_positions: np.ndarray,
         direct_pairs: list[str] | None = None,
     ) -> list[PairPositionTimeseries]:
-        """Build position timeseries for each direct pair.
+        """Build position timeseries for each direct pair from stored positions.
 
         Args:
             timestamps: Array of timestamps
             event_types: List of event types
-            sides: Array of sides
-            qtys: Array of quantities
             pairs: List of pairs
             prices: Array of mid prices (for position USD valuation)
+            net_positions: Array of net positions (stored during simulation)
             direct_pairs: List of direct pairs to track
 
         Returns:
@@ -309,15 +312,12 @@ class RiskMetricsCalculator:
         if direct_pairs is None:
             direct_pairs = ["EURUSD", "GBPUSD"]
 
-        # Track positions per pair
-        pair_positions: dict[str, list[PositionTimeseriesPoint]] = {
-            pair: [] for pair in direct_pairs
+        # Track last position at each timestamp per pair
+        # Key: (timestamp_ms, pair) -> (position, price)
+        # Using dict to keep LAST position at each timestamp (after all events processed)
+        pair_last_positions: dict[str, dict[int, tuple[float, float]]] = {
+            pair: {} for pair in direct_pairs
         }
-        pair_cum_positions: dict[str, float] = {pair: 0.0 for pair in direct_pairs}
-
-        # Track seen hedge fills to avoid double-counting
-        # Key: (timestamp_ms, pair) -> already counted
-        seen_hedge_fills: set[tuple[int, str]] = set()
 
         for i in range(len(timestamps)):
             pair = pairs[i] if i < len(pairs) else ""
@@ -327,34 +327,37 @@ class RiskMetricsCalculator:
 
             event_type = event_types[i]
 
-            # Only update on fills
-            if event_type == "client_fill":
-                pair_cum_positions[pair] += sides[i] * qtys[i]
-            elif event_type == "hedge_fill":
-                # Deduplicate hedge fills - only count once per (timestamp, pair)
-                hedge_key = (int(timestamps[i]), pair)
-                if hedge_key in seen_hedge_fills:
-                    continue
-                seen_hedge_fills.add(hedge_key)
-                pair_cum_positions[pair] += sides[i] * qtys[i]
-            else:
+            # Only track fills (position-changing events)
+            if event_type not in ("client_fill", "hedge_fill"):
                 continue
 
-            # Get mid price for USD conversion (position * mid = USD value)
+            # Use stored net_position from parquet
+            position = net_positions[i] if i < len(net_positions) else 0.0
             price = prices[i] if i < len(prices) else 1.0
+            ts = int(timestamps[i])
 
-            pair_positions[pair].append(
-                PositionTimeseriesPoint(
-                    timestamp_ms=int(timestamps[i]),
-                    position=pair_cum_positions[pair],
-                    position_usd=pair_cum_positions[pair] * price,
-                )
-            )
+            # Store/overwrite position at this timestamp (keeps LAST position)
+            # This ensures that if client_fill at t=100 (pos=3M) and hedge_fill at t=100 (pos=0),
+            # we show the final position (0) not the intermediate (3M)
+            pair_last_positions[pair][ts] = (position, price)
 
-        # Build result
+        # Build result from last positions
         result = []
         for pair in direct_pairs:
-            points = pair_positions.get(pair, [])
+            ts_positions = pair_last_positions.get(pair, {})
+
+            # Sort by timestamp and build points
+            points = []
+            for ts in sorted(ts_positions.keys()):
+                position, price = ts_positions[ts]
+                points.append(
+                    PositionTimeseriesPoint(
+                        timestamp_ms=ts,
+                        position=position,
+                        position_usd=position * price,
+                    )
+                )
+
             max_pos = 0.0
             max_pos_usd = 0.0
             if points:
@@ -481,59 +484,76 @@ class RiskMetricsCalculator:
         return cvar
 
     def _compute_ops_metrics(
-        self, data: dict[str, list], client_volume: float
+        self,
+        data: dict[str, list],
+        client_volume: float,
+        direct_pairs: list[str] | None = None,
     ) -> OpsMetrics:
         """Compute operational metrics.
 
         Args:
             data: Dict of column arrays from parquet
             client_volume: Total client volume (fallback, we compute from data)
+            direct_pairs: List of direct pairs to include (for consistency with internalization)
 
         Returns:
-            OpsMetrics
+            OpsMetrics with volumes in USD equivalent
         """
+        if direct_pairs is None:
+            direct_pairs = ["EURUSD", "GBPUSD"]
+
         event_types = data.get("event_type", [])
         timestamps = data.get("timestamp_ms", [])
         pairs = data.get("pair", [])
         qtys = np.array(data.get("qty", []))
+        prices = np.array(data.get("price", [1.0] * len(qtys)))
 
         # Count and sum hedge trades (deduplicated)
         # Each hedge can appear multiple times in the file (attributed to multiple source trades)
         seen_hedges: set[tuple[int, str]] = set()
         hedge_count = 0
-        total_hedge_volume = 0.0
+        total_hedge_volume_usd = 0.0
 
-        # Also compute client volume directly from data
-        computed_client_volume = 0.0
+        # Also compute client volume directly from data (in USD)
+        computed_client_volume_usd = 0.0
 
         for i, event_type in enumerate(event_types):
+            pair = pairs[i] if i < len(pairs) else ""
+
+            # Filter by direct pairs for consistency with internalization metrics
+            if pair not in direct_pairs:
+                continue
+
+            qty = qtys[i] if i < len(qtys) else 0.0
+            price = prices[i] if i < len(prices) else 1.0
+            qty_usd = qty * price  # Convert to USD equivalent
+
             if event_type == "hedge_fill":
                 ts = timestamps[i] if i < len(timestamps) else 0
-                pair = pairs[i] if i < len(pairs) else ""
                 hedge_key = (int(ts), pair)
                 if hedge_key not in seen_hedges:
                     seen_hedges.add(hedge_key)
                     hedge_count += 1
-                    total_hedge_volume += qtys[i]
+                    total_hedge_volume_usd += qty_usd
             elif event_type == "client_fill":
-                computed_client_volume += qtys[i]
+                computed_client_volume_usd += qty_usd
 
         # Use computed client volume if available, otherwise fall back to parameter
-        effective_client_volume = computed_client_volume if computed_client_volume > 0 else client_volume
+        effective_client_volume = computed_client_volume_usd if computed_client_volume_usd > 0 else client_volume
 
-        # Hedge volume ratio
+        # Hedge volume ratio (both in USD now, so ratio is consistent)
         hedge_volume_ratio = 0.0
         if effective_client_volume > 0:
-            hedge_volume_ratio = total_hedge_volume / effective_client_volume
+            hedge_volume_ratio = total_hedge_volume_usd / effective_client_volume
 
-        # Average hedge size
+        # Average hedge size (in USD)
         avg_hedge_size = 0.0
         if hedge_count > 0:
-            avg_hedge_size = total_hedge_volume / hedge_count
+            avg_hedge_size = total_hedge_volume_usd / hedge_count
 
         return OpsMetrics(
             hedge_count=hedge_count,
-            total_hedge_volume=total_hedge_volume,
+            total_hedge_volume=total_hedge_volume_usd,
             hedge_volume_ratio=hedge_volume_ratio,
             avg_hedge_size=avg_hedge_size,
             total_client_volume=effective_client_volume,

@@ -5,7 +5,14 @@
 import { useState, useEffect } from 'react'
 import { listDatasets, getDataset, type DatasetSummary } from '../../api/datasets'
 import { listTradeBooks, type TradeBookSummary } from '../../api/tradebooks'
-import { createRun, type RunConfig, type SimulationConfig, type GeneralConfig } from '../../api/runs'
+import {
+  createRun,
+  type RunConfig,
+  type SimulationConfig,
+  type GeneralConfig,
+  type HedgingRuleSet,
+} from '../../api/runs'
+import { HedgingRuleBuilder } from './HedgingRuleBuilder'
 
 type Step = 'data' | 'config' | 'simulation' | 'review'
 
@@ -14,17 +21,28 @@ interface RunCreateFormProps {
   onCancel: () => void
 }
 
-const HEDGE_POLICIES = [
-  { value: 'aggressive', label: 'Aggressive', description: 'Hedge immediately when position exceeds band' },
-  { value: 'passive', label: 'Passive', description: 'Wait for natural offsetting flow' },
-]
-
-const HEDGE_MODES = [
-  { value: 'full', label: 'Full', description: 'Hedge entire excess position' },
-  { value: 'partial', label: 'Partial', description: 'Hedge down to band edge only' },
-]
-
 const REPORTING_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY']
+
+// Default hedging rule set: no hedge for 0-1000, full hedge above
+const DEFAULT_HEDGING_RULES: HedgingRuleSet = {
+  groups: [],
+  rules: [
+    {
+      pair_or_group: 'ALL',
+      amount_type: 'absolute',
+      from_amount: 0,
+      to_amount: 1000,
+      action: { action_type: 'no_hedge' },
+    },
+    {
+      pair_or_group: 'ALL',
+      amount_type: 'absolute',
+      from_amount: 1000,
+      to_amount: Infinity,
+      action: { action_type: 'hedge_percentage', hedge_percentage: 1.0 },
+    },
+  ],
+}
 
 /**
  * Convert date from YYYYMMDD to YYYY-MM-DD format for API submission.
@@ -58,13 +76,10 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
   const [directPairs, setDirectPairs] = useState<string[]>([])
 
   // Form values - Simulation Settings
-  const [hedgePolicy, setHedgePolicy] = useState('aggressive')
-  const [hedgeMode, setHedgeMode] = useState('full')
-  const [riskBandQty, setRiskBandQty] = useState(1000)
   const [reportingCurrency, setReportingCurrency] = useState('USD')
   const [sampleInterval, setSampleInterval] = useState(60)
-  const [enablePairBands, setEnablePairBands] = useState(false)
-  const [pairBands, setPairBands] = useState<Record<string, number>>({})
+  const [hedgingRules, setHedgingRules] = useState<HedgingRuleSet>(DEFAULT_HEDGING_RULES)
+  const [hedgeDelayMs, setHedgeDelayMs] = useState(0)
 
   // Form values - Review
   const [runName, setRunName] = useState('')
@@ -147,27 +162,21 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
     setSubmitting(true)
     setError(null)
 
-    // Build pair_bands object with only non-default values
-    const effectivePairBands: Record<string, number> = {}
-    if (enablePairBands) {
-      for (const pair of availablePairs) {
-        const pairBand = pairBands[pair]
-        if (pairBand !== undefined && pairBand !== riskBandQty) {
-          effectivePairBands[pair] = pairBand
-        }
-      }
-    }
+    // Prepare hedging rules - convert Infinity to a large number for JSON serialization
+    const serializableRules = hedgingRules.rules.map((rule) => ({
+      ...rule,
+      to_amount: isFinite(rule.to_amount) ? rule.to_amount : 1e18,
+    }))
 
     const simConfig: SimulationConfig = {
       dataset: selectedDataset,
       reporting_currency: reportingCurrency,
-      hedge_policy: hedgePolicy,
-      hedge_policy_config: {
-        risk_band_qty: riskBandQty,
-        hedge_mode: hedgeMode,
-        ...(Object.keys(effectivePairBands).length > 0 && { pair_bands: effectivePairBands }),
-      },
       sample_interval_seconds: sampleInterval,
+      hedging_rules: {
+        groups: hedgingRules.groups,
+        rules: serializableRules,
+      },
+      hedge_delay_ms: hedgeDelayMs,
     }
 
     const generalConfig: GeneralConfig = {
@@ -398,62 +407,7 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
       {/* Step 3: Simulation Settings */}
       {step === 'simulation' && (
         <div className="form-step">
-          <div className="form-section">
-            <h3>Hedge Policy</h3>
-            <div className="radio-group">
-              {HEDGE_POLICIES.map((policy) => (
-                <label key={policy.value} className="radio-option">
-                  <input
-                    type="radio"
-                    name="hedgePolicy"
-                    value={policy.value}
-                    checked={hedgePolicy === policy.value}
-                    onChange={(e) => setHedgePolicy(e.target.value)}
-                  />
-                  <div className="radio-content">
-                    <span className="radio-label">{policy.label}</span>
-                    <span className="radio-description">{policy.description}</span>
-                  </div>
-                </label>
-              ))}
-            </div>
-          </div>
-
-          <div className="form-section">
-            <h3>Hedge Mode</h3>
-            <div className="radio-group">
-              {HEDGE_MODES.map((mode) => (
-                <label key={mode.value} className="radio-option">
-                  <input
-                    type="radio"
-                    name="hedgeMode"
-                    value={mode.value}
-                    checked={hedgeMode === mode.value}
-                    onChange={(e) => setHedgeMode(e.target.value)}
-                  />
-                  <div className="radio-content">
-                    <span className="radio-label">{mode.label}</span>
-                    <span className="radio-description">{mode.description}</span>
-                  </div>
-                </label>
-              ))}
-            </div>
-          </div>
-
           <div className="form-row">
-            <div className="form-field">
-              <label>Risk Band Quantity</label>
-              <input
-                type="number"
-                className="form-input"
-                value={riskBandQty}
-                onChange={(e) => setRiskBandQty(Number(e.target.value))}
-                min={0}
-                step={100}
-              />
-              <span className="form-hint">Base currency units</span>
-            </div>
-
             <div className="form-field">
               <label>Reporting Currency</label>
               <select
@@ -481,56 +435,31 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
                 <option value={300}>5 minutes</option>
               </select>
             </div>
+
+            <div className="form-field">
+              <label>Hedge Delay (ms)</label>
+              <input
+                type="number"
+                className="form-input"
+                value={hedgeDelayMs}
+                onChange={(e) => setHedgeDelayMs(Math.max(0, Number(e.target.value)))}
+                min={0}
+                step={10}
+                placeholder="0"
+              />
+              <p className="form-hint">
+                Delay before hedge execution (0 = immediate). Use to visualize position changes.
+              </p>
+            </div>
           </div>
 
           <div className="form-section">
-            <label className="checkbox-option">
-              <input
-                type="checkbox"
-                checked={enablePairBands}
-                onChange={(e) => {
-                  setEnablePairBands(e.target.checked)
-                  if (e.target.checked && Object.keys(pairBands).length === 0) {
-                    // Initialize all pairs with global default
-                    const initialBands: Record<string, number> = {}
-                    for (const pair of availablePairs) {
-                      initialBands[pair] = riskBandQty
-                    }
-                    setPairBands(initialBands)
-                  }
-                }}
-              />
-              <span>Configure per-pair bands</span>
-            </label>
-            {enablePairBands && (
-              <div className="pair-bands-table">
-                <div className="pair-bands-header">
-                  <span>Pair</span>
-                  <span>Band Qty (base currency)</span>
-                </div>
-                {availablePairs.map((pair) => (
-                  <div key={pair} className="pair-bands-row">
-                    <span className="pair-name">{pair}</span>
-                    <input
-                      type="number"
-                      className="form-input"
-                      value={pairBands[pair] ?? riskBandQty}
-                      onChange={(e) =>
-                        setPairBands((prev) => ({
-                          ...prev,
-                          [pair]: Number(e.target.value),
-                        }))
-                      }
-                      min={0}
-                      step={100}
-                    />
-                  </div>
-                ))}
-                <p className="form-hint">
-                  Pairs using the global default ({riskBandQty.toLocaleString()}) are not included in the config.
-                </p>
-              </div>
-            )}
+            <h3>Hedging Configuration</h3>
+            <HedgingRuleBuilder
+              ruleSet={hedgingRules}
+              availablePairs={availablePairs}
+              onChange={setHedgingRules}
+            />
           </div>
 
           <div className="form-actions">
@@ -595,30 +524,45 @@ export function RunCreateForm({ onCreated, onCancel }: RunCreateFormProps) {
                 <span className="summary-value">{directPairs.join(', ') || 'None'}</span>
               </div>
               <div className="summary-row">
-                <span className="summary-label">Hedge Policy:</span>
-                <span className="summary-value">{hedgePolicy} / {hedgeMode}</span>
+                <span className="summary-label">Reporting Currency:</span>
+                <span className="summary-value">{reportingCurrency}</span>
               </div>
               <div className="summary-row">
-                <span className="summary-label">Risk Band:</span>
-                <span className="summary-value">
-                  {riskBandQty.toLocaleString()} units
-                  {enablePairBands && ' (global default)'}
-                </span>
+                <span className="summary-label">Sample Interval:</span>
+                <span className="summary-value">{sampleInterval}s</span>
               </div>
-              {enablePairBands && Object.entries(pairBands).filter(([, val]) => val !== riskBandQty).length > 0 && (
+              <div className="summary-row">
+                <span className="summary-label">Hedge Delay:</span>
+                <span className="summary-value">{hedgeDelayMs}ms{hedgeDelayMs === 0 ? ' (immediate)' : ''}</span>
+              </div>
+              {hedgingRules.groups.length > 0 && (
                 <div className="summary-row">
-                  <span className="summary-label">Per-Pair Bands:</span>
+                  <span className="summary-label">Pair Groups:</span>
                   <span className="summary-value">
-                    {Object.entries(pairBands)
-                      .filter(([, val]) => val !== riskBandQty)
-                      .map(([pair, val]) => `${pair}: ${val.toLocaleString()}`)
-                      .join(', ')}
+                    {hedgingRules.groups.map((g) => `${g.name} (${g.pairs.join(', ')})`).join('; ')}
                   </span>
                 </div>
               )}
               <div className="summary-row">
-                <span className="summary-label">Reporting Currency:</span>
-                <span className="summary-value">{reportingCurrency}</span>
+                <span className="summary-label">Hedging Rules:</span>
+                <span className="summary-value">{hedgingRules.rules.length} rule(s)</span>
+              </div>
+              <div className="rules-summary">
+                {hedgingRules.rules.map((rule, idx) => (
+                  <div key={idx} className="rule-summary-item">
+                    <span className="rule-target">{rule.pair_or_group}</span>
+                    <span className="rule-range">
+                      {rule.from_amount.toLocaleString()} - {isFinite(rule.to_amount) ? rule.to_amount.toLocaleString() : '∞'}
+                    </span>
+                    <span className="rule-action">
+                      {rule.action.action_type === 'no_hedge' && 'No Hedge'}
+                      {rule.action.action_type === 'hedge_to_target' &&
+                        `Target ${((rule.action as { target_percentage: number }).target_percentage * 100).toFixed(0)}%`}
+                      {rule.action.action_type === 'hedge_percentage' &&
+                        `Hedge ${((rule.action as { hedge_percentage: number }).hedge_percentage * 100).toFixed(0)}%`}
+                    </span>
+                  </div>
+                ))}
               </div>
             </div>
           </div>

@@ -23,7 +23,12 @@
       "Bash(git status:*)",
       "Bash(git check-ignore:*)",
       "Bash(git commit -m \"$\\(cat <<''EOF''\nfeat: implement Phase 5 risk, internalization, and manager-grade reporting\n\nBackend:\n- Add RiskMetrics, OpsMetrics, InternalizationMetrics, EfficientFrontierScores models\n- Create RiskMetricsCalculator service for computing risk/ops/internalization metrics\n- Create KPI definitions registry with documented formulas and interpretations\n- Implement /results/{id}/risk, /internalization, /trades endpoints\n- Add /kpi/definitions and /kpi/compare endpoints\n- Integrate risk calculation into orchestrator''s _write_final_results\\(\\)\n- Add get_trades\\(\\) method to RunService\n\nFrontend:\n- Install recharts for charting\n- Create results API client with typed functions\n- Implement ScoreCard, KPICard components with tooltip support\n- Create PnLChart \\(timeseries\\) and PnLBreakdownChart \\(bar chart\\)\n- Create RiskPanel, InternalizationPanel, OpsPanel components\n- Implement Results page with run selector, scorecard, and tabbed panels\n- Add comprehensive CSS styling for results components\n\nAll 209 backend tests and 15 frontend tests pass.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
-      "Bash(npm run lint)"
+      "Bash(npm run lint)",
+      "Bash(pushd:*)",
+      "Bash(git -C \"C:\\\\Users\\\\jgehu\\\\QUANT\\\\Projects\\\\nexus\" diff --stat)",
+      "Bash(git -C \"C:\\\\Users\\\\jgehu\\\\QUANT\\\\Projects\\\\nexus\" log --oneline -5)",
+      "Bash(git -C \"C:\\\\Users\\\\jgehu\\\\QUANT\\\\Projects\\\\nexus\" add backend/efxbt/src/efxbt/core/config/hedging_config.py backend/efxbt/tests/core/config/ frontend/src/components/results/TradesTable.tsx frontend/src/components/runs/HedgingRuleBuilder.tsx frontend/src/components/runs/PairGroupManager.tsx)",
+      "Bash(git -C \"C:\\\\Users\\\\jgehu\\\\QUANT\\\\Projects\\\\nexus\" add -u)"
     ]
   }
 }

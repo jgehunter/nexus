@@ -329,16 +329,20 @@ class SweepService:
         decross_config_dict = copy.deepcopy(sweep_config.base_decross_config)
         general_config_dict = copy.deepcopy(sweep_config.base_general_config)
 
-        # Ensure hedge_policy_config exists
-        if "hedge_policy_config" not in sim_config_dict:
-            sim_config_dict["hedge_policy_config"] = {}
+        # Determine which hedging rules preset to use
+        # Default to first preset if no index specified
+        hedging_rules_idx = params.get("hedging_rules_index", 0)
+        hedging_rules = sweep_config.hedging_rules_presets[hedging_rules_idx]
 
-        # Apply parameter overrides
+        # Set hedging_rules in simulation config
+        sim_config_dict["hedging_rules"] = hedging_rules.model_dump()
+
+        # Apply other parameter overrides
         for key, value in params.items():
-            if key in ["risk_band_qty", "hedge_mode"]:
-                # Goes into hedge_policy_config
-                sim_config_dict["hedge_policy_config"][key] = value
-            elif key in ["reporting_currency", "hedge_policy", "sample_interval_seconds"]:
+            if key == "hedging_rules_index":
+                # Already handled above
+                continue
+            elif key in ["reporting_currency", "sample_interval_seconds", "hedge_delay_ms"]:
                 # Top-level simulation config
                 sim_config_dict[key] = value
             elif key in ["max_path_length", "min_leg_qty", "priority_currencies", "use_banker_rounding"]:
@@ -358,9 +362,19 @@ class SweepService:
         # Build GeneralConfig (sweeps don't modify direct_pairs, use defaults)
         general_config = GeneralConfig()  # type: ignore[call-arg]
 
-        # Build final RunConfig
-        param_str = ", ".join(f"{k}={v}" for k, v in params.items())
-        name = f"{sweep_config.name or 'Sweep'}: {param_str}" if params else sweep_config.name
+        # Build final RunConfig with readable name
+        # For hedging rules, show the preset name if available
+        param_parts = []
+        for k, v in params.items():
+            if k == "hedging_rules_index":
+                preset = sweep_config.hedging_rules_presets[v]
+                preset_name = preset.name or f"Preset {v}"
+                param_parts.append(f"rules={preset_name}")
+            else:
+                param_parts.append(f"{k}={v}")
+
+        param_str = ", ".join(param_parts)
+        name = f"{sweep_config.name or 'Sweep'}: {param_str}" if param_parts else sweep_config.name
 
         return RunConfig(
             dataset=sweep_config.dataset,
@@ -605,15 +619,21 @@ class SweepService:
         swept_param_names = sweep_config.parameter_grid.expand_all().keys()
 
         for param_name in swept_param_names:
-            if param_name in ["risk_band_qty", "hedge_mode"]:
-                # From hedge_policy_config
+            if param_name == "hedging_rules_index":
+                # Find which preset matches this run's hedging rules
                 if run_config.simulation_config:
-                    value = run_config.simulation_config.hedge_policy_config.get(
-                        param_name
-                    )
-                    if value is not None:
-                        result[param_name] = value
-            elif param_name in ["hedge_policy", "reporting_currency", "sample_interval_seconds"]:
+                    run_rules = run_config.simulation_config.hedging_rules
+                    # Try to find matching preset index
+                    for idx, preset in enumerate(sweep_config.hedging_rules_presets):
+                        if preset.name == run_rules.name:
+                            result[param_name] = idx
+                            # Also include readable name
+                            result["hedging_rules_name"] = preset.name or f"Preset {idx}"
+                            break
+                    else:
+                        # If no match found, just show the name
+                        result["hedging_rules_name"] = run_rules.name or "Unknown"
+            elif param_name in ["reporting_currency", "sample_interval_seconds", "hedge_delay_ms"]:
                 # Top-level simulation config
                 if run_config.simulation_config:
                     value = getattr(run_config.simulation_config, param_name, None)

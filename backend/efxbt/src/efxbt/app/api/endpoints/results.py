@@ -169,6 +169,11 @@ async def get_trades(
     limit: int = Query(default=100, ge=1, le=1000, description="Max trades to return"),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
     pair: str | None = Query(default=None, description="Filter by currency pair"),
+    event_type: str | None = Query(
+        default=None,
+        pattern="^(client_fill|hedge_fill)$",
+        description="Filter by event type: 'client_fill' or 'hedge_fill'",
+    ),
 ) -> TradesResponse:
     """Get trade-level details for a run.
 
@@ -180,6 +185,7 @@ async def get_trades(
         limit: Maximum number of trades to return
         offset: Pagination offset
         pair: Optional pair filter (e.g., "EURUSD")
+        event_type: Optional event type filter ('client_fill' or 'hedge_fill')
 
     Returns:
         TradesResponse with paginated trade records
@@ -189,7 +195,9 @@ async def get_trades(
         409: Run not completed
     """
     try:
-        trades, total = service.get_trades(run_id, limit=limit, offset=offset, pair=pair)
+        trades, total = service.get_trades(
+            run_id, limit=limit, offset=offset, pair=pair, event_type=event_type
+        )
         return TradesResponse(
             run_id=run_id,
             trades=trades,

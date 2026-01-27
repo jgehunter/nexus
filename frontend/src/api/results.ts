@@ -273,12 +273,14 @@ export async function getTrades(
   runId: string,
   limit = 100,
   offset = 0,
-  pair?: string
+  pair?: string,
+  eventType?: 'client_fill' | 'hedge_fill'
 ): Promise<TradesResponse> {
   const params = new URLSearchParams()
   params.set('limit', String(limit))
   params.set('offset', String(offset))
   if (pair) params.set('pair', pair)
+  if (eventType) params.set('event_type', eventType)
   return apiGet<TradesResponse>(`/results/${runId}/trades?${params.toString()}`)
 }
 

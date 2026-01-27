@@ -16,8 +16,34 @@ import pyarrow.parquet as pq
 import pytest
 
 from efxbt.core.config.run_config import SimulationConfig
+from efxbt.core.config.hedging_config import (
+    HedgingRuleSet, HedgingRule, NoHedgeParams, HedgePercentageParams
+)
 from efxbt.core.data.schemas import DecrossedTradeRecord
 from efxbt.engine.simulation.simulator import MultiShardSimulator
+
+
+def make_hedging_rules(risk_band_qty: float = 1000.0) -> HedgingRuleSet:
+    """Create hedging rules similar to the old aggressive policy."""
+    return HedgingRuleSet(
+        groups=[],
+        rules=[
+            HedgingRule(
+                pair_or_group="ALL",
+                amount_type="absolute",
+                from_amount=0,
+                to_amount=risk_band_qty,
+                action=NoHedgeParams(),
+            ),
+            HedgingRule(
+                pair_or_group="ALL",
+                amount_type="absolute",
+                from_amount=risk_band_qty,
+                to_amount=float("inf"),
+                action=HedgePercentageParams(hedge_percentage=1.0),
+            ),
+        ],
+    )
 
 
 def create_test_trade(
@@ -175,8 +201,7 @@ class TestMultiShardSimulator:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -200,8 +225,7 @@ class TestMultiShardSimulator:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -234,8 +258,7 @@ class TestMultiShardSimulator:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -260,8 +283,7 @@ class TestMultiShardSimulator:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -307,8 +329,7 @@ class TestMultiShardSimulator:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -333,8 +354,7 @@ class TestMultiShardSimulator:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -359,8 +379,7 @@ class TestMultiShardSimulator:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -391,8 +410,7 @@ class TestMultiShardSimulatorEdgeCases:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 
@@ -418,8 +436,7 @@ class TestMultiShardSimulatorEdgeCases:
         config = SimulationConfig(
             dataset="test",
             reporting_currency="USD",
-            hedge_policy="aggressive",
-            hedge_policy_config={"risk_band_qty": 1000.0, "hedge_mode": "full"},
+            hedging_rules=make_hedging_rules(risk_band_qty=1000.0),
             sample_interval_seconds=30,
         )
 

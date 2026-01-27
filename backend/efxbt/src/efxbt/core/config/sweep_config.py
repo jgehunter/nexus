@@ -5,6 +5,8 @@ from typing import Annotated, Any, Union
 
 from pydantic import BaseModel, Field, model_validator
 
+from .hedging_config import HedgingRule, HedgingRuleSet, NoHedgeParams
+
 
 class SweepStatus(str, Enum):
     """Sweep lifecycle states."""
@@ -60,36 +62,31 @@ class SweepParameterGrid(BaseModel):
     Example:
         ```python
         SweepParameterGrid(
-            risk_band_qty=ParameterRange(min=1e6, max=10e6, step=3e6),
-            hedge_mode=["full", "partial"],
+            hedging_rules_index=[0, 1, 2],  # Sweep over 3 different hedging rule sets
+            sample_interval_seconds=ParameterRange(min=30, max=120, step=30),
         )
         ```
     """
 
-    # Simulation parameters (hedge_policy_config)
-    risk_band_qty: Annotated[
+    # Hedging rules - index into hedging_rules_presets list
+    hedging_rules_index: Annotated[
+        list[int] | None,
+        Field(
+            default=None,
+            description="Indices into hedging_rules_presets to sweep (e.g., [0, 1, 2])",
+        ),
+    ]
+
+    # Hedge delay
+    hedge_delay_ms: Annotated[
         ParameterSpec | None,
         Field(
             default=None,
-            description="Risk band quantity values to sweep (hedge_policy_config.risk_band_qty)",
-        ),
-    ]
-    hedge_mode: Annotated[
-        list[str] | None,
-        Field(
-            default=None,
-            description="Hedge mode values to sweep (hedge_policy_config.hedge_mode)",
+            description="Hedge delay values in milliseconds to sweep",
         ),
     ]
 
     # Simulation config top-level
-    hedge_policy: Annotated[
-        list[str] | None,
-        Field(
-            default=None,
-            description="Hedge policy names to sweep (e.g., ['aggressive', 'passive'])",
-        ),
-    ]
     reporting_currency: Annotated[
         list[str] | None,
         Field(
@@ -139,9 +136,8 @@ class SweepParameterGrid(BaseModel):
 
         # Define fields and their types
         param_fields = [
-            "risk_band_qty",
-            "hedge_mode",
-            "hedge_policy",
+            "hedging_rules_index",
+            "hedge_delay_ms",
             "reporting_currency",
             "sample_interval_seconds",
             "max_path_length",
@@ -212,17 +208,40 @@ class SweepConfig(BaseModel):
         description="End date (YYYY-MM-DD), defaults to dataset end",
     )
 
+    # Hedging rule presets to sweep over
+    # Each preset is a complete HedgingRuleSet configuration
+    hedging_rules_presets: Annotated[
+        list[HedgingRuleSet],
+        Field(
+            default_factory=lambda: [
+                HedgingRuleSet(
+                    name="No Hedge",
+                    groups=[],
+                    rules=[
+                        HedgingRule(
+                            pair_or_group="ALL",
+                            from_amount=0,
+                            to_amount=float("inf"),
+                            action=NoHedgeParams(),
+                        )
+                    ],
+                )
+            ],
+            description="List of hedging rule configurations to sweep over",
+        ),
+    ]
+
     # Base simulation config (fixed parameters not being swept)
+    # hedging_rules will be filled from hedging_rules_presets based on index
     base_simulation_config: Annotated[
         dict[str, Any],
         Field(
             default_factory=lambda: {
-                "hedge_policy": "aggressive",
-                "hedge_policy_config": {"risk_band_qty": 1000.0, "hedge_mode": "full"},
                 "reporting_currency": "USD",
                 "sample_interval_seconds": 60,
+                "hedge_delay_ms": 0,
             },
-            description="Base simulation configuration (overridden by sweep parameters)",
+            description="Base simulation configuration (hedging_rules comes from presets)",
         ),
     ]
 
@@ -264,6 +283,19 @@ class SweepConfig(BaseModel):
         default=None,
         description="Optional sweep description",
     )
+
+    @model_validator(mode="after")
+    def validate_hedging_rules_indices(self) -> "SweepConfig":
+        """Validate that hedging_rules_index values are valid."""
+        if self.parameter_grid.hedging_rules_index:
+            max_idx = len(self.hedging_rules_presets) - 1
+            for idx in self.parameter_grid.hedging_rules_index:
+                if idx < 0 or idx > max_idx:
+                    raise ValueError(
+                        f"hedging_rules_index {idx} is out of range "
+                        f"(0-{max_idx} for {len(self.hedging_rules_presets)} presets)"
+                    )
+        return self
 
     def get_total_configs(self) -> int:
         """Get total number of configurations in the sweep."""

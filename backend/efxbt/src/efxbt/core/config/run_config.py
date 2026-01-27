@@ -5,6 +5,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
+from .hedging_config import HedgingRuleSet
+
 # Canonical direct pairs - pairs that typically have market data and can be hedged externally
 DEFAULT_DIRECT_PAIRS = [
     "EURUSD", "EURCHF", "EURCZK", "EURDKK", "EURHUF", "EURNOK", "EURPLN", "EURRON", "EURSEK",
@@ -66,7 +68,7 @@ class SimulationConfig(BaseModel):
     """Configuration for simulation engine.
 
     Controls hedge policies, sampling behavior, and execution models for
-    the shard-based simulation engine (Phase 3).
+    the shard-based simulation engine.
     """
 
     # Market dataset (referenced from RunConfig.dataset)
@@ -87,24 +89,11 @@ class SimulationConfig(BaseModel):
         ),
     ]
 
-    # Hedge policy
-    hedge_policy: Annotated[
-        str,
-        Field(
-            default="aggressive",
-            description="Hedge policy name: 'aggressive', 'passive', etc.",
-        ),
-    ]
-    hedge_policy_config: Annotated[
-        dict,
-        Field(
-            default_factory=lambda: {
-                "risk_band_qty": 1000.0,
-                "hedge_mode": "full",
-            },
-            description="Policy-specific configuration dict",
-        ),
-    ]
+    # Rule-based hedging configuration
+    hedging_rules: HedgingRuleSet = Field(
+        ...,
+        description="Rule-based hedging configuration with groups and rules",
+    )
 
     # Sampling grid
     sample_interval_seconds: Annotated[
@@ -122,6 +111,16 @@ class SimulationConfig(BaseModel):
         Field(
             default=True,
             description="Use mid price for unrealized PnL calculations",
+        ),
+    ]
+
+    # Hedge execution delay
+    hedge_delay_ms: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description="Delay in milliseconds before hedge execution (0 = immediate)",
         ),
     ]
 
